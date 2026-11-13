@@ -68,7 +68,7 @@ hermes config set plugins.entries.deepseek-web-tools.settings.thinking true
 
 | Key (`plugins.entries.deepseek-web-tools.settings.*`) | Default | Meaning |
 |---|---|---|
-| `model` | `deepseek-flash` | The only model the vendor documents for the server tools. |
+| `model_name` | `deepseek-flash` | The only model the vendor documents for the server tools. Named `model_name` because `model` is a reserved settings root in Hermes. |
 | `thinking` | `false` | Default for every call. **Off on purpose:** the server default is *enabled*, and deep thinking search bills reasoning tokens plus up to ~20 searches. |
 | `with_read_url` | `true` | Also declare `deepseek_read_url` so URLs passed to the tool are read. Harmless when no URL is passed. |
 | `timeout_s` | `90` | Per-attempt HTTP timeout. Three attempts plus backoff bound one call at about 4.5 minutes; the plugin API exposes no `execution_timeout`, so the budget lives here. |

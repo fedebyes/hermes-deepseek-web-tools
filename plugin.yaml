@@ -14,7 +14,7 @@ requires_env:
     url: https://platform.deepseek.com/api_keys
     secret: true
 config_schema:
-  model:
+  model_name:
     type: str
     default: deepseek-flash
     description: "Model to drive the server tools with. The vendor documents the server tools for deepseek-flash."

@@ -3,8 +3,8 @@
 ``web_research`` puts ``deepseek_web_search`` (and optionally ``deepseek_read_url``) inside a
 single Chat Completions call: the model searches, opens pages and finds text inside them on
 the vendor's side, then answers with structured citations. The plugin adds one tool and
-nothing else - no hooks, no overrides, and four settings (model, thinking, with_read_url,
-timeout_s).
+nothing else - no hooks, no overrides, and four settings (model_name, thinking,
+with_read_url, timeout_s).
 """
 
 from __future__ import annotations
@@ -48,7 +48,9 @@ def _cfg(ctx, key: str, default):
 
 def register(ctx) -> None:
     """Called once by the plugin loader."""
-    model = _cfg(ctx, "model", client.DEFAULT_MODEL)
+    # ``model`` is a reserved settings root in Hermes (_PLUGIN_SETTING_RESERVED_ROOTS),
+    # so the key is ``model_name``: get_config would reject the shorter form.
+    model = _cfg(ctx, "model_name", client.DEFAULT_MODEL)
     thinking_default = _cfg(ctx, "thinking", False)
     with_read_url = _cfg(ctx, "with_read_url", True)
     timeout = _cfg(ctx, "timeout_s", client.TIMEOUT_S)
