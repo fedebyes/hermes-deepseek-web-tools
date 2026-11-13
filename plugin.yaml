@@ -1,5 +1,5 @@
 name: deepseek-web-tools
-version: "1.0.2"
+version: "1.0.3"
 manifest_version: 2
 description: "DeepSeek's server-side web tools as one tool: web_research answers a question from the live web with structured citations in a single call. thinking is opt-in (the server default bills up to ~20 searches) and page text never comes back - use web_extract for content."
 author: Fedebyes
@@ -13,7 +13,7 @@ optional_env:
     description: "Test seam only: the exact origin https://api.deepseek.com or a loopback host; anything else is refused and the default endpoint used."
 requires_env:
   - name: DEEPSEEK_API_KEY
-    description: "DeepSeek API key. Searches and fetches are billed per successful request ($0.75 / 1,000)."
+    description: "DeepSeek API key. Searches and fetches are billed per successful query ($0.75 / 1,000) — one search call with three queries counts as three."
     url: https://platform.deepseek.com/api_keys
     secret: true
 config_schema:

@@ -75,8 +75,10 @@ hermes config set plugins.entries.deepseek-web-tools.settings.thinking true
 
 ## Cost and limits
 
-- **$0.75 per 1,000 successful** search and fetch requests, billed per request — not per token,
-  not per result count. Failed calls, empty results and timeouts are not billed.
+- **$0.75 per 1,000 successful** search and fetch **queries**, billed per query — not per token,
+  not per result count: one search call carrying three queries is three units. Failed calls, empty
+  results and timeouts are not billed. The `Billed requests:` line in the tool result counts exactly
+  these units, so a call can be reconciles against the vendor's usage page.
 - Rate limits are per account and published on DeepSeek's Search & Fetch page (the documented
   numbers have moved before — the client's job is to survive them, not to encode them). Overruns
   are HTTP 429; the client retries 408/429/5xx up to three times with backoff.

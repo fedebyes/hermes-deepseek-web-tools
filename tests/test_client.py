@@ -283,7 +283,7 @@ class RunTests(unittest.TestCase):
         captured, out = self._capture({"query": "q",
                                        "urls": [f"https://e.com/{i}" for i in range(12)]})
         self.assertEqual(len(captured["urls"]), 10)
-        self.assertIn("2 extra URL(s) ignored", out)
+        self.assertIn("2 URL(s) over the vendor's 10-page cap not sent", out)
 
     def test_per_call_thinking_override_wins(self):
         captured, _ = self._capture({"query": "q", "thinking": True}, thinking_default=False)
@@ -412,7 +412,7 @@ class CoercionTests(unittest.TestCase):
         finally:
             client.research = original
         self.assertEqual(captured["urls"], ["https://a.example"])
-        self.assertIn("1 extra URL(s) ignored", out)
+        self.assertIn("1 duplicate or blank URL(s) ignored", out)
 
     def test_a_generation_failure_surfaces_the_vendor_message(self):
         body = {"error": {"message": "please retry", "code": "server_error"},
@@ -433,6 +433,32 @@ class CoercionTests(unittest.TestCase):
     def test_a_trailing_slash_does_not_spend_a_second_slot(self):
         picked = client.dedupe_urls(["https://x.example/a", "https://x.example/a/"])
         self.assertEqual(picked, ["https://x.example/a"])
+
+    def test_duplicates_and_the_page_cap_are_reported_as_different_causes(self):
+        captured: dict = {}
+
+        def fake_research(query, **kwargs):
+            captured.update(kwargs)
+            return client.parse_response(_body(citations=0))
+
+        original = client.research
+        client.research = fake_research
+        try:
+            urls = [f"https://e.com/{i}" for i in range(12)] + ["https://e.com/0"]
+            out = client.run({"query": "q", "urls": urls})
+        finally:
+            client.research = original
+        self.assertEqual(len(captured["urls"]), 10)
+        self.assertIn("1 duplicate or blank URL(s) ignored", out)
+        self.assertIn("2 URL(s) over the vendor's 10-page cap not sent", out)
+
+    def test_only_tool_counters_are_called_billed(self):
+        usage = {"tool_search": 3, "tool_fetch": 2, "tool_image_search": 0,
+                 "tool_other": 5, "some_display_stat": 9, "unknown_not_an_int": "x"}
+        self.assertEqual(client.billed_counters(usage),
+                         "fetch=2, other=5, search=3")   # display stats are not money
+        self.assertEqual(client.billed_counters(None), "")
+        self.assertEqual(client.billed_counters({"tool_search": 0}), "")
 
     def test_a_dict_of_urls_does_not_leak_its_keys(self):
         captured = {}

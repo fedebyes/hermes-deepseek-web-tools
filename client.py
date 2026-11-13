@@ -75,7 +75,7 @@ def resolve_api_key() -> str | None:
         # Only "there is no Hermes host here" may fall back (standalone tests / live_accept).
         # A transitive ImportError inside a real install is a broken core, not a standalone run,
         # and must not silently degrade into the unscoped read rule 11 bans.
-        if (getattr(exc, "name", "") or "").split(".")[0] != "agent":
+        if (getattr(exc, "name", "") or "") != "agent":   # exact: `agentx` is not the host
             raise
         return os.environ.get("DEEPSEEK_API_KEY") or None
     return get_secret("DEEPSEEK_API_KEY") or None
@@ -107,6 +107,7 @@ def base_url() -> str:
     if not raw:
         return DEFAULT_BASE_URL
     parts = None
+    refuse_reason = "not the exact origin"
     try:
         parts = urllib.parse.urlsplit(raw)
         host = (parts.hostname or "").lower()
@@ -116,24 +117,39 @@ def base_url() -> str:
                  and parts.port in (None, 443) and clean_tail and not bad_userinfo)
         loopback = (parts.scheme in ("http", "https") and host in _LOOPBACK_HOSTS
                     and not bad_userinfo)
-    except ValueError:
+    except ValueError as exc:               # unparseable URL, or a port urlsplit refuses
         exact = loopback = False
+        refuse_reason = f"unparseable: {exc}"
     if not (exact or loopback):
         # Never re-parse: the value may be the unparseable one that just raised, and a second
         # urlsplit would turn "refuse and fall back" into a crash on every call.
         scheme = (parts.scheme or "?") if parts is not None else "unparseable"
         host = (parts.hostname or "?") if parts is not None else "unparseable"
-        logger.warning("DEEPSEEK_BASE_URL ignored: %s://%s is not the exact origin %s "
-                       "and is not loopback; using the default endpoint", scheme, host, DEFAULT_BASE_URL)
+        logger.warning("DEEPSEEK_BASE_URL ignored: %s://%s (%s); using the default endpoint",
+                       scheme, host, refuse_reason)
         return DEFAULT_BASE_URL
     return raw.rstrip("/")
 
 
 # ─── request ─────────────────────────────────────────────────────────────────
 
-def dedupe_urls(urls: list[str] | None) -> list[str]:
+def billed_counters(usage: dict[str, Any] | None) -> str:
+    """Only ``tool_*`` counters price a request; other ``server_tool_use`` keys are display stats.
+
+    The vendor's usage block is a mixed bag and its vocabulary changes; filtering by prefix keeps
+    a future ``tool_*`` counter billable and a future non-billed counter out of "Billed requests".
+    """
+    return ", ".join(f"{name[len('tool_'):]}={value}"
+                     for name, value in sorted((usage or {}).items())
+                     if name.startswith("tool_") and isinstance(value, int) and value)
+
+
+def dedupe_urls(urls: list[str] | None, limit: int | None = MAX_URLS) -> list[str]:
     """Trim, drop empties and de-duplicate, keeping order — the vendor counts the first 10
-    *distinct* URLs, so a duplicate would spend a slot the model never gets to use."""
+    *distinct* URLs, so a duplicate would spend a slot the model never gets to use.
+
+    ``limit=None`` returns every distinct page; ``run`` uses that to tell a duplicate from a page
+    dropped by the cap, which are different things to report."""
     seen: set[str] = set()
     picked: list[str] = []
     for raw in urls or []:
@@ -143,7 +159,7 @@ def dedupe_urls(urls: list[str] | None) -> list[str]:
             continue
         seen.add(key)
         picked.append(url)
-        if len(picked) == MAX_URLS:
+        if limit is not None and len(picked) == limit:
             break
     return picked
 
@@ -285,9 +301,7 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
         detail = str(error.get("message") or "").strip() if isinstance(error, dict) else str(error)
         code = error.get("code") if isinstance(error, dict) else None
         reason = f"generation failed{f' ({code})' if code else ''}"
-        usage = (body.get("usage") or {}).get("server_tool_use") or {}
-        billed = ", ".join(f"{name.replace('tool_', '')}={value}"
-                           for name, value in sorted(usage.items()) if value)
+        billed = billed_counters((body.get("usage") or {}).get("server_tool_use"))
         if billed:                                  # a failed generation still billed the round
             detail = f"{detail} (billed: {billed})" if detail else f"billed: {billed}"
         raise WebToolsError(f"{reason}: {detail}" if detail else reason)
@@ -358,12 +372,9 @@ def render(result: dict[str, Any], *, thinking: bool) -> str:
     if failures:
         parts.append("Failed calls: " + ", ".join(failures))
 
-    usage = (result.get("usage") or {}).get("server_tool_use") or {}
-    if usage:
-        billed = ", ".join(f"{name.replace('tool_', '')}={value}"
-                           for name, value in sorted(usage.items()) if value)
-        if billed:
-            parts.append(f"Billed requests: {billed}")
+    billed = billed_counters((result.get("usage") or {}).get("server_tool_use"))
+    if billed:
+        parts.append(f"Billed requests: {billed}")
 
     finish = result.get("finish_reason")
     if finish and finish != "stop":
@@ -420,8 +431,10 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
     elif isinstance(urls, dict):                    # a mapping would otherwise iterate its keys
         urls = list(urls.values())
     raw_urls = [str(u).strip() for u in urls if str(u).strip()]
-    urls = dedupe_urls(raw_urls)
-    dropped = len(raw_urls) - len(urls)
+    unique = dedupe_urls(raw_urls, limit=None)
+    urls = unique[:MAX_URLS]
+    duplicates = len(raw_urls) - len(unique)
+    over_cap = len(unique) - len(urls)
 
     image_url = (args.get("image_url") or "").strip() or None
 
@@ -436,6 +449,11 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
         return f"web_research failed: {type(exc).__name__}: {exc}"
 
     text = render(result, thinking=thinking)
-    if dropped > 0:
-        text += f"\n\n({dropped} extra URL(s) ignored: the vendor considers 10.)"
+    notes = []
+    if duplicates:
+        notes.append(f"{duplicates} duplicate or blank URL(s) ignored")
+    if over_cap:                                    # a different cause: 12 distinct pages, cap 10
+        notes.append(f"{over_cap} URL(s) over the vendor's 10-page cap not sent")
+    if notes:
+        text += f"\n\n({'; '.join(notes)}.)"
     return text
