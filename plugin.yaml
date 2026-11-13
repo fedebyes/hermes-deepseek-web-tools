@@ -1,5 +1,5 @@
 name: deepseek-web-tools
-version: "1.0.1"
+version: "1.0.2"
 manifest_version: 2
 description: "DeepSeek's server-side web tools as one tool: web_research answers a question from the live web with structured citations in a single call. thinking is opt-in (the server default bills up to ~20 searches) and page text never comes back - use web_extract for content."
 author: Fedebyes
@@ -8,6 +8,9 @@ homepage: https://github.com/fedebyes/hermes-deepseek-web-tools
 requires_hermes: ">=0.22.5"
 provides_tools:
   - web_research
+optional_env:
+  - name: DEEPSEEK_BASE_URL
+    description: "Test seam only: the exact origin https://api.deepseek.com or a loopback host; anything else is refused and the default endpoint used."
 requires_env:
   - name: DEEPSEEK_API_KEY
     description: "DeepSeek API key. Searches and fetches are billed per successful request ($0.75 / 1,000)."
@@ -25,8 +28,8 @@ config_schema:
   with_read_url:
     type: bool
     default: true
-    description: "Also declare deepseek_read_url, so URLs passed to the tool are read by the model. Harmless when no URL is passed."
+    description: "Also declare deepseek_read_url, so URLs passed to the tool are read by the model. Harmless when no URL is passed, and inert when thinking is on: the vendor then runs deep thinking search and does not read links separately."
   timeout_s:
     type: int
     default: 90
-    description: "Per-attempt HTTP timeout in seconds. Three attempts plus backoff bound one call at about 4.5 minutes: the plugin API exposes no execution_timeout, so this is where the budget lives."
+    description: "Per-socket HTTP timeout in seconds, clamped to 5..120. Not a hard wall-clock bound: a server trickling the body can exceed it, and the real ceiling is the agent's tool deadline (420 s), which the plugin does not own."

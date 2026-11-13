@@ -157,6 +157,12 @@ class BaseUrlGuardTests(_EnvMixin, unittest.TestCase):
         ("https://user:pw@api.deepseek.com", client.DEFAULT_BASE_URL),
         ("https://evil.example", client.DEFAULT_BASE_URL),
         ("https://api.deepseek.com/v1", client.DEFAULT_BASE_URL),
+        # unparseable values must fall back, not raise: a malformed env var used to crash every
+        # call because the warning branch re-parsed the string that had just failed
+        ("https://[::1", client.DEFAULT_BASE_URL),
+        ("https://[bad", client.DEFAULT_BASE_URL),
+        ("https://api.deepseek.com:99999999", client.DEFAULT_BASE_URL),
+        ("ftp://x", client.DEFAULT_BASE_URL),
     )
 
     def test_guard(self):
@@ -338,13 +344,24 @@ class SecretScopeTests(unittest.TestCase):
     def test_an_unscoped_read_hides_the_tool_and_never_touches_env(self):
         os.environ["DEEPSEEK_API_KEY"] = "sk-env-must-not-be-used"
 
+        class UnscopedSecretError(RuntimeError):
+            """Mirrors the core class by name: that is what the plugin keys on."""
+
         def get_secret(name, default=None):
-            raise RuntimeError("no secret scope installed")
+            raise UnscopedSecretError("no secret scope installed")
 
         self._install(get_secret)
         self.assertFalse(client.key_available())
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(UnscopedSecretError):
             client.resolve_api_key()          # the raise is not swallowed either
+
+    def test_any_other_secret_failure_is_left_to_the_registry(self):
+        def get_secret(name, default=None):
+            raise RuntimeError("a real bug, not a scope problem")
+
+        self._install(get_secret)
+        with self.assertRaises(RuntimeError):   # fail loud, do not hide a broken install
+            client.key_available()
 
 
 # ─── argument and body coercion ─────────────────────────────────────────────
@@ -405,6 +422,55 @@ class CoercionTests(unittest.TestCase):
         self.assertIn("please retry", str(ctx.exception))
         self.assertIn("server_error", str(ctx.exception))
 
+    def test_a_generation_failure_still_reports_what_was_billed(self):
+        body = {"error": {"message": "content refused"}, "usage": {
+            "server_tool_use": {"tool_search": 12, "tool_fetch": 3, "tool_image_search": 0}}}
+        with self.assertRaises(client.WebToolsError) as ctx:
+            client.parse_response(body)
+        self.assertIn("search=12", str(ctx.exception))
+        self.assertIn("fetch=3", str(ctx.exception))       # the only record of a billed failure
+
+    def test_a_trailing_slash_does_not_spend_a_second_slot(self):
+        picked = client.dedupe_urls(["https://x.example/a", "https://x.example/a/"])
+        self.assertEqual(picked, ["https://x.example/a"])
+
+    def test_a_dict_of_urls_does_not_leak_its_keys(self):
+        captured = {}
+
+        def fake_research(query, **kwargs):
+            captured.update(kwargs)
+            return client.parse_response(_body(citations=0))
+
+        original = client.research
+        client.research = fake_research
+        try:
+            client.run({"query": "q", "urls": {"a": "https://a.example"}})
+        finally:
+            client.research = original
+        self.assertEqual(captured["urls"], ["https://a.example"])
+
+    def test_the_timeout_is_clamped(self):
+        self.assertEqual(client.clamp_timeout(0), client.MIN_TIMEOUT_S)
+        self.assertEqual(client.clamp_timeout(-5), client.MIN_TIMEOUT_S)
+        self.assertEqual(client.clamp_timeout(9999), client.MAX_TIMEOUT_S)
+        self.assertEqual(client.clamp_timeout(30), 30)
+        self.assertEqual(client.clamp_timeout("nonsense"), client.TIMEOUT_S)
+
+    def test_the_clamped_timeout_reaches_the_call(self):
+        captured = {}
+
+        def fake_research(query, **kwargs):
+            captured.update(kwargs)
+            return client.parse_response(_body(citations=0))
+
+        original = client.research
+        client.research = fake_research
+        try:
+            client.run({"query": "q"}, timeout=9999)
+        finally:
+            client.research = original
+        self.assertEqual(captured["timeout"], client.MAX_TIMEOUT_S)
+
     def test_a_failed_call_shows_its_error_code(self):
         body = _body(citations=0)
         body["choices"][0]["message"]["server_tool_calls"][0]["calls"][0].update(
@@ -412,6 +478,79 @@ class CoercionTests(unittest.TestCase):
         text = client.render(client.parse_response(body), thinking=False)
         self.assertIn("Failed calls:", text)
         self.assertIn("url_not_allowed", text)
+
+
+# ─── registration and the settings contract ─────────────────────────────────
+
+def _load_plugin_package():
+    """Import the plugin package the way the loader does — as a package, so `from . import client`
+    resolves. The directory name contains a hyphen, which is why this is not a plain import."""
+    name = "dsweb_plugin_under_test"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)])
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class RegisterTests(unittest.TestCase):
+    """`hermes plugins validate` proves declared capabilities match registrations; it cannot see
+    WHICH keys `get_config` is asked for. `model`, `plugins`, `security` and `settings` are
+    reserved roots that raise, and `_cfg` maps a raise to the default — so renaming a setting back
+    to `model` would leave it silently inert. These assertions are the only thing that catches it.
+    """
+
+    RESERVED = {"model", "plugins", "security", "settings"}
+
+    def setUp(self):
+        self.plugin = _load_plugin_package()
+
+    @staticmethod
+    def _ctx(tools, asked, raise_on_config=False):
+        class Ctx:
+            def get_config(self, key, default=None):
+                asked.append(key)
+                if raise_on_config:
+                    raise ValueError("Rejected config path")
+                return default
+
+            def register_tool(self, **kwargs):
+                tools.append(kwargs)
+
+        return Ctx()
+
+    def test_asks_only_legal_settings_keys_and_registers_one_tool(self):
+        asked: list = []
+        tools: list = []
+        self.plugin.register(self._ctx(tools, asked))
+
+        self.assertTrue(asked)
+        roots = {key.split(".")[0] for key in asked}
+        self.assertFalse(roots & self.RESERVED, f"reserved settings root in {sorted(roots)}")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "web_research")
+        self.assertEqual(tools[0]["toolset"], "web")
+        self.assertTrue(callable(tools[0]["handler"]))
+        self.assertTrue(callable(tools[0]["check_fn"]))
+
+    def test_a_rejected_settings_read_does_not_take_the_tool_down(self):
+        tools: list = []
+        self.plugin.register(self._ctx(tools, [], raise_on_config=True))   # must not raise
+        self.assertEqual(len(tools), 1)
+
+    def test_the_handler_returns_a_string_when_no_key_is_available(self):
+        tools: list = []
+        self.plugin.register(self._ctx(tools, []))
+        previous = os.environ.pop("DEEPSEEK_API_KEY", None)
+        try:
+            out = tools[0]["handler"]({"query": "q"})
+        finally:
+            if previous is not None:
+                os.environ["DEEPSEEK_API_KEY"] = previous
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.startswith("web_research failed:"), out)
 
 
 if __name__ == "__main__":

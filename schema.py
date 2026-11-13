@@ -46,7 +46,8 @@ WEB_RESEARCH_SCHEMA = _schema(
             "maxItems": 10,
             "description": "Optional http(s) pages to read as the basis of the answer. The vendor "
                            "considers the first 10 distinct URLs only, and the model picks which "
-                           "ones to read.",
+                           "ones to read. Ignored when thinking=true: with thinking on the vendor "
+                           "runs deep thinking search and does not read links separately.",
         },
         "image_url": {
             "type": "string",

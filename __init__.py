@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "web_research"
 TOOLSET = "web"
 
+
 def _cfg(ctx, key: str, default):
     """Read one setting, coerced to ``default``'s type; a bad value falls back to the default.
 
@@ -53,7 +54,7 @@ def register(ctx) -> None:
     model = _cfg(ctx, "model_name", client.DEFAULT_MODEL)
     thinking_default = _cfg(ctx, "thinking", False)
     with_read_url = _cfg(ctx, "with_read_url", True)
-    timeout = _cfg(ctx, "timeout_s", client.TIMEOUT_S)
+    timeout = client.clamp_timeout(_cfg(ctx, "timeout_s", client.TIMEOUT_S))
 
     def handle(args: dict, **_kwargs) -> str:
         """Run one web_research call. Returns a string; never raises into the agent loop."""

@@ -50,7 +50,7 @@ the tool hides itself (`check_fn`) instead of failing at call time.
 | Param | Type | Notes |
 |---|---|---|
 | `query` | string, required | The question. Say how it should be sourced when it matters. |
-| `urls` | string[] | Up to 10 http(s) pages to read as the basis of the answer. The vendor considers only the first 10 distinct URLs, and the model picks which to read. |
+| `urls` | string[] | Up to 10 http(s) pages to read as the basis of the answer. The vendor considers only the first 10 distinct URLs, and the model picks which to read. **Ignored with `thinking: true`**: the vendor then runs deep thinking search and does not read links separately. |
 | `image_url` | string | An https image to search/reason about (image search is part of `deepseek_web_search`). Publicly reachable, ≤8192 characters. |
 | `thinking` | boolean | Per-call override. `true` = deep thinking search (multi-step, more expensive), `false` = a single search step. |
 
@@ -70,15 +70,19 @@ hermes config set plugins.entries.deepseek-web-tools.settings.thinking true
 |---|---|---|
 | `model_name` | `deepseek-flash` | The only model the vendor documents for the server tools. Named `model_name` because `model` is a reserved settings root in Hermes. |
 | `thinking` | `false` | Default for every call. **Off on purpose:** the server default is *enabled*, and deep thinking search bills reasoning tokens plus up to ~20 searches. |
-| `with_read_url` | `true` | Also declare `deepseek_read_url` so URLs passed to the tool are read. Harmless when no URL is passed. |
-| `timeout_s` | `90` | Per-attempt HTTP timeout. Three attempts plus backoff bound one call at about 4.5 minutes; the plugin API exposes no `execution_timeout`, so the budget lives here. |
+| `with_read_url` | `true` | Also declare `deepseek_read_url` so URLs passed to the tool are read. Harmless when no URL is passed, inert when `thinking` is on. |
+| `timeout_s` | `90` | Per-socket HTTP timeout, clamped to 5..120. Not a hard wall-clock bound — a server trickling the body can exceed it; the real ceiling is the agent's tool deadline (420 s), which the plugin does not own. |
 
 ## Cost and limits
 
 - **$0.75 per 1,000 successful** search and fetch requests, billed per request — not per token,
   not per result count. Failed calls, empty results and timeouts are not billed.
-- Rate limits are per account: 100 QPS search, 25 QPS fetch, plus a per-domain cap on fetch.
-  Overruns are HTTP 429; the client retries 408/429/5xx up to three times with backoff.
+- Rate limits are per account and published on DeepSeek's Search & Fetch page (the documented
+  numbers have moved before — the client's job is to survive them, not to encode them). Overruns
+  are HTTP 429; the client retries 408/429/5xx up to three times with backoff.
+- `thinking` and `urls` do not combine: with thinking on, the round *is* deep thinking search and
+  the vendor skips URL reading, so a URL list buys nothing there — read the pages with
+  `web_extract`, or keep `thinking` off for that call.
 - A `thinking=false` call is typically one search; `thinking=true` can reach ~20 billed calls.
   Choose accordingly — one deliberate deep call usually beats five shallow ones.
 - **"Not billed" is about the request, not the turn.** A search or fetch that never produced a
@@ -105,8 +109,8 @@ uv run scripts/live_accept.py
 ## Security
 
 See [SECURITY.md](SECURITY.md). Short version: one outbound host (`api.deepseek.com`), the key is
-resolved through Hermes' provider layer and never logged, no file I/O, no subprocesses, no
-telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
+resolved through `agent.secret_scope.get_secret` (the profile-scoped accessor) and never
+logged, no file I/O, no subprocesses, no telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
 point the bearer key at another host is refused.
 
 ## Uninstall

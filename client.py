@@ -30,17 +30,22 @@ TIMEOUT_S = 90        # per attempt; 3 attempts + backoff bounds one call at ~4.
                       # (PluginContext.register_tool exposes no execution_timeout, so the
                       # budget has to live here rather than in the tool registration)
 MAX_ATTEMPTS = 3
+MIN_TIMEOUT_S = 5
+MAX_TIMEOUT_S = 120   # above this a single call can outlive the 420 s tool deadline, and the
+                      # await aborts while the worker thread keeps billing the vendor round
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DETAIL_LIMIT = 300    # never let a vendor error body flood the context
 
+# Per-page outcomes (url_not_allowed, unavailable) arrive as call-level error codes on a 200,
+# never as an HTTP status on POST /chat/completions - so these hints stay about the request.
 _ERROR_HINTS: dict[int, str] = {
-    400: "request rejected - tool_choice cannot name a server tool, and web_search_options is "
-         "refused when these tools are declared",
+    400: "request rejected - an unknown parameter, a model_name the vendor does not serve, or a "
+         "tool_choice naming a server tool",
     401: "DeepSeek API key missing or invalid",
     402: "DeepSeek account balance too low",
-    403: "the page was rejected by the vendor's security policy",
-    404: "no usable content for that URL",
+    403: "the request was refused by policy",
+    404: "endpoint not found - check the base URL",
     413: "request body too large (image)",
     429: "rate limited",
 }
@@ -66,7 +71,12 @@ def resolve_api_key() -> str | None:
     """
     try:
         from agent.secret_scope import get_secret
-    except ImportError:                             # standalone: no Hermes host on sys.path
+    except ModuleNotFoundError as exc:
+        # Only "there is no Hermes host here" may fall back (standalone tests / live_accept).
+        # A transitive ImportError inside a real install is a broken core, not a standalone run,
+        # and must not silently degrade into the unscoped read rule 11 bans.
+        if (getattr(exc, "name", "") or "").split(".")[0] != "agent":
+            raise
         return os.environ.get("DEEPSEEK_API_KEY") or None
     return get_secret("DEEPSEEK_API_KEY") or None
 
@@ -75,9 +85,14 @@ def key_available() -> bool:
     """``check_fn`` for the tool registry: hide the tool when the key is missing or unscoped."""
     try:
         return resolve_api_key() is not None
-    except Exception as exc:                        # UnscopedSecretError: hide, never widen
-        logger.debug("DEEPSEEK_API_KEY not resolvable in this scope: %s", exc)
-        return False
+    except Exception as exc:
+        # Hide the tool on an unscoped read, but say it out loud: in a multiplexed install this
+        # is a spawn-site scoping bug, and silence would look like "the key is not configured".
+        # Anything else is a real failure and is left to the registry, which logs it fail-closed.
+        if type(exc).__name__ == "UnscopedSecretError":
+            logger.warning("DEEPSEEK_API_KEY is unscoped here (%s) - hiding web_research", exc)
+            return False
+        raise
 
 
 def base_url() -> str:
@@ -91,6 +106,7 @@ def base_url() -> str:
     raw = (os.environ.get("DEEPSEEK_BASE_URL") or "").strip()
     if not raw:
         return DEFAULT_BASE_URL
+    parts = None
     try:
         parts = urllib.parse.urlsplit(raw)
         host = (parts.hostname or "").lower()
@@ -103,10 +119,12 @@ def base_url() -> str:
     except ValueError:
         exact = loopback = False
     if not (exact or loopback):
-        parts = urllib.parse.urlsplit(raw)
+        # Never re-parse: the value may be the unparseable one that just raised, and a second
+        # urlsplit would turn "refuse and fall back" into a crash on every call.
+        scheme = (parts.scheme or "?") if parts is not None else "unparseable"
+        host = (parts.hostname or "?") if parts is not None else "unparseable"
         logger.warning("DEEPSEEK_BASE_URL ignored: %s://%s is not the exact origin %s "
-                       "and is not loopback; using the default endpoint",
-                       parts.scheme or "?", parts.hostname or "?", DEFAULT_BASE_URL)
+                       "and is not loopback; using the default endpoint", scheme, host, DEFAULT_BASE_URL)
         return DEFAULT_BASE_URL
     return raw.rstrip("/")
 
@@ -120,13 +138,24 @@ def dedupe_urls(urls: list[str] | None) -> list[str]:
     picked: list[str] = []
     for raw in urls or []:
         url = str(raw).strip()
-        if not url or url in seen:
+        key = url.rstrip("/")                       # same page to the vendor, one slot here
+        if not url or key in seen:
             continue
-        seen.add(url)
+        seen.add(key)
         picked.append(url)
         if len(picked) == MAX_URLS:
             break
     return picked
+
+
+def clamp_timeout(value: Any, default: int = TIMEOUT_S) -> int:
+    """Bound the per-attempt timeout: urlopen rejects 0 and negatives, and a huge value lets a
+    call outlive the tool deadline (the vendor round is billed even when the await aborts)."""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_TIMEOUT_S, min(seconds, MAX_TIMEOUT_S))
 
 
 def as_bool(value: Any, *, default: bool = False) -> bool:
@@ -256,6 +285,11 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
         detail = str(error.get("message") or "").strip() if isinstance(error, dict) else str(error)
         code = error.get("code") if isinstance(error, dict) else None
         reason = f"generation failed{f' ({code})' if code else ''}"
+        usage = (body.get("usage") or {}).get("server_tool_use") or {}
+        billed = ", ".join(f"{name.replace('tool_', '')}={value}"
+                           for name, value in sorted(usage.items()) if value)
+        if billed:                                  # a failed generation still billed the round
+            detail = f"{detail} (billed: {billed})" if detail else f"billed: {billed}"
         raise WebToolsError(f"{reason}: {detail}" if detail else reason)
     choice = choices[0] or {}
     message = choice.get("message") or {}
@@ -383,6 +417,8 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
     urls = args.get("urls") or []
     if isinstance(urls, str):                       # tolerate a bare string
         urls = [urls]
+    elif isinstance(urls, dict):                    # a mapping would otherwise iterate its keys
+        urls = list(urls.values())
     raw_urls = [str(u).strip() for u in urls if str(u).strip()]
     urls = dedupe_urls(raw_urls)
     dropped = len(raw_urls) - len(urls)
@@ -392,7 +428,7 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
     try:
         result = research(query, urls=urls or None, image_url=image_url,
                           thinking=thinking, model=model, with_read_url=with_read_url,
-                          timeout=timeout)
+                          timeout=clamp_timeout(timeout))
     except WebToolsError as exc:
         return f"web_research failed: {exc}"
     except Exception as exc:                        # never break the agent loop
