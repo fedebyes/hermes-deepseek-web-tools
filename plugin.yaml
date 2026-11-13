@@ -1,0 +1,32 @@
+name: deepseek-web-tools
+version: "1.0.0"
+manifest_version: 2
+description: "DeepSeek's server-side web tools as one Hermes tool: web_research sends a question to deepseek-flash with deepseek_web_search (and deepseek_read_url) declared, so the model searches, opens pages and finds text inside them on DeepSeek's side and answers with structured citations. thinking is off by default - the server default is on, and deep thinking search makes up to ~20 billed calls. Page text does not come back (the vendor keeps it encrypted in a per-call signature), so this answers questions with sources; use web_extract when the text itself is needed."
+author: Fedebyes
+license: MIT
+homepage: https://github.com/fedebyes/hermes-deepseek-web-tools
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - web_research
+requires_env:
+  - name: DEEPSEEK_API_KEY
+    description: "DeepSeek API key. Searches and fetches are billed per successful request ($0.75 / 1,000)."
+    url: https://platform.deepseek.com/api_keys
+    secret: true
+config_schema:
+  model:
+    type: str
+    default: deepseek-flash
+    description: "Model to drive the server tools with. The vendor documents the server tools for deepseek-flash."
+  thinking:
+    type: bool
+    default: false
+    description: "Enable deep thinking search by default for every call. Off: one search step, answer with citations. On: up to ~20 calls (search / open_page / find_in_page) and reasoning tokens billed, for multi-step fact-checking."
+  with_read_url:
+    type: bool
+    default: true
+    description: "Also declare deepseek_read_url, so URLs passed to the tool are read by the model. Harmless when no URL is passed."
+  timeout_s:
+    type: int
+    default: 180
+    description: "Per-attempt HTTP timeout in seconds."
