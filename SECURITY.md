@@ -21,9 +21,12 @@ public content and do not put secrets in it.
 
 ## The API key
 
-- Resolved through Hermes' own provider layer (`agent.web_search_provider.get_provider_env`), with
-  an environment fallback for standalone runs. The plugin never reads `.env` or any secrets file
-  itself.
+- Resolved through `agent.secret_scope.get_secret`, which honours the turn's profile scope. In
+  multiplexed installs an unscoped read **raises** `UnscopedSecretError`; the plugin does not catch
+  it into a bare `os.environ` read — the tool hides itself instead (`check_fn` returns false). The
+  `os.environ` path exists only for standalone runs (test suite, `scripts/live_accept.py`), where
+  the Hermes host package is not importable.
+- The plugin never reads `.env` or any secrets file itself.
 - Never logged, never included in an error message, never written to disk. Error bodies are
   truncated to 300 characters, and the request header is never echoed.
 - A missing key makes the tool **hide** (`check_fn`), rather than fail on first call.
@@ -53,6 +56,18 @@ pass. Read page text is returned to the model **encrypted inside a per-call `sig
 plugin cannot decrypt it and does not try. Content that fails the vendor's safety review comes back
 as a `url_not_allowed` / `content_filter` result, surfaced in the tool output as a failed call or a
 non-`stop` `finish_reason`.
+
+## Indirect prompt injection
+
+`web_research` returns text the vendor's model wrote and page titles the vendor chose, and it puts
+both into the tool result **the agent trusts**. Web content is attacker-controlled by definition, so
+a page can carry instructions aimed at the model ("ignore your rules and…"). Two things follow:
+
+- Treat a `web_research` result as untrusted content, not as an instruction. It is data with
+  sources attached, and the sources are what make it checkable.
+- The tool grants no capability of its own: it cannot write files, run commands or spawn anything.
+  An injected instruction that reaches the agent still has to pass the same approval layers as any
+  other model decision — which is why this plugin declares no hooks and no tool overrides.
 
 ## Reporting
 

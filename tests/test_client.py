@@ -1,6 +1,6 @@
 """Offline unit tests for the deepseek-web-tools client (stdlib unittest, no pytest).
 
-Run:  ``uv run config/asus/hermes-plugins/deepseek-web-tools/tests/test_client.py``
+Run:  ``uv run tests/test_client.py``
 
 No network, no key, no plugin host: the transport is injected, so every wire behaviour
 (retries, error mapping, parsing, rendering) is asserted without a vendor call. The live
@@ -18,6 +18,7 @@ import io
 import json
 import os
 import sys
+import types
 import unittest
 import urllib.error
 from pathlib import Path
@@ -287,6 +288,130 @@ class RunTests(unittest.TestCase):
     def test_accepts_a_bare_string_url(self):
         captured, _ = self._capture({"query": "q", "urls": "https://example.com/x"})
         self.assertEqual(captured["urls"], ["https://example.com/x"])
+
+
+# ─── credential scope ───────────────────────────────────────────────────────
+
+class SecretScopeTests(unittest.TestCase):
+    """The key must come from the scoped accessor, and an unscoped read must hide the tool.
+
+    Falling back to ``os.environ`` on ``UnscopedSecretError`` would hand a multiplexed install
+    another profile's credential (catalog rule 11), so the fallback is asserted against.
+    """
+
+    NAMES = ("agent", "agent.secret_scope")
+
+    def setUp(self):
+        self._saved = {name: sys.modules.get(name) for name in self.NAMES}
+        self._saved_env = os.environ.get("DEEPSEEK_API_KEY")
+
+    def tearDown(self):
+        for name, module in self._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+        if self._saved_env is None:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+        else:
+            os.environ["DEEPSEEK_API_KEY"] = self._saved_env
+
+    def _install(self, get_secret):
+        agent = types.ModuleType("agent")
+        scope = types.ModuleType("agent.secret_scope")
+        scope.get_secret = get_secret
+        agent.secret_scope = scope
+        sys.modules["agent"] = agent
+        sys.modules["agent.secret_scope"] = scope
+
+    def test_key_comes_from_the_scoped_accessor(self):
+        seen = {}
+
+        def get_secret(name, default=None):
+            seen["name"] = name
+            return "sk-from-scope"
+
+        self._install(get_secret)
+        self.assertEqual(client.resolve_api_key(), "sk-from-scope")
+        self.assertEqual(seen["name"], "DEEPSEEK_API_KEY")
+
+    def test_an_unscoped_read_hides_the_tool_and_never_touches_env(self):
+        os.environ["DEEPSEEK_API_KEY"] = "sk-env-must-not-be-used"
+
+        def get_secret(name, default=None):
+            raise RuntimeError("no secret scope installed")
+
+        self._install(get_secret)
+        self.assertFalse(client.key_available())
+        with self.assertRaises(RuntimeError):
+            client.resolve_api_key()          # the raise is not swallowed either
+
+
+# ─── argument and body coercion ─────────────────────────────────────────────
+
+class CoercionTests(unittest.TestCase):
+    def test_as_bool_parses_string_forms(self):
+        for value in ("false", "0", "off", "no", "", "  false  "):
+            with self.subTest(value=value):
+                self.assertIs(client.as_bool(value, default=True), False)
+        for value in ("true", "1", "on", "yes", 1, 2.0, True):
+            with self.subTest(value=value):
+                self.assertIs(client.as_bool(value, default=False), True)
+        self.assertIs(client.as_bool(None, default=True), True)
+
+    def test_a_string_false_from_the_model_does_not_buy_a_deep_search(self):
+        captured = {}
+
+        def fake_research(query, **kwargs):
+            captured.update(kwargs)
+            return client.parse_response(_body(citations=0))
+
+        original = client.research
+        client.research = fake_research
+        try:
+            client.run({"query": "q", "thinking": "false"}, thinking_default=True)
+        finally:
+            client.research = original
+        self.assertIs(captured["thinking"], False)
+
+    def test_duplicate_urls_do_not_spend_slots(self):
+        urls = ["https://a.example", "https://a.example", " https://b.example "]
+        urls += [f"https://c.example/{i}" for i in range(12)]
+        picked = client.dedupe_urls(urls)
+        self.assertEqual(len(picked), 10)
+        self.assertEqual(picked[:2], ["https://a.example", "https://b.example"])
+
+    def test_a_duplicate_url_is_reported_only_when_one_was_dropped(self):
+        captured = {}
+
+        def fake_research(query, **kwargs):
+            captured.update(kwargs)
+            return client.parse_response(_body(citations=0))
+
+        original = client.research
+        client.research = fake_research
+        try:
+            out = client.run({"query": "q", "urls": ["https://a.example", "https://a.example"]})
+        finally:
+            client.research = original
+        self.assertEqual(captured["urls"], ["https://a.example"])
+        self.assertIn("1 extra URL(s) ignored", out)
+
+    def test_a_generation_failure_surfaces_the_vendor_message(self):
+        body = {"error": {"message": "please retry", "code": "server_error"},
+                "usage": {"server_tool_use": {"tool_search": 1}}}
+        with self.assertRaises(client.WebToolsError) as ctx:
+            client.parse_response(body)
+        self.assertIn("please retry", str(ctx.exception))
+        self.assertIn("server_error", str(ctx.exception))
+
+    def test_a_failed_call_shows_its_error_code(self):
+        body = _body(citations=0)
+        body["choices"][0]["message"]["server_tool_calls"][0]["calls"][0].update(
+            {"status": "failed", "error": {"code": "url_not_allowed"}})
+        text = client.render(client.parse_response(body), thinking=False)
+        self.assertIn("Failed calls:", text)
+        self.assertIn("url_not_allowed", text)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@
 ``web_research`` puts ``deepseek_web_search`` (and optionally ``deepseek_read_url``) inside a
 single Chat Completions call: the model searches, opens pages and finds text inside them on
 the vendor's side, then answers with structured citations. The plugin adds one tool and
-nothing else - no hooks, no overrides, no config of its own beyond three knobs.
+nothing else - no hooks, no overrides, and four settings (model, thinking, with_read_url,
+timeout_s).
 """
 
 from __future__ import annotations
@@ -18,14 +19,13 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "web_research"
 TOOLSET = "web"
 
-_TRUE = {"1", "true", "yes", "on"}
-
-
 def _cfg(ctx, key: str, default):
     """Read one setting, coerced to ``default``'s type; a bad value falls back to the default.
 
-    A settings read that fails must never take the tool down (the plugin host may be running
-    with no config on disk - validation and tests do exactly that).
+    Settings live under ``plugins.entries.<plugin-id>.settings.<key>`` - ``ctx.get_config``
+    resolves that subtree (legacy ``.config`` still honoured), so a value set anywhere else in
+    the entry is invisible here. A failed read must never take the tool down: the plugin host
+    may run with no config on disk, which is exactly what validation does.
     """
     try:
         value = ctx.get_config(key, default)
@@ -34,10 +34,10 @@ def _cfg(ctx, key: str, default):
     if value is None:
         return default
     if isinstance(default, bool):
-        if isinstance(value, bool):
-            return value
-        return str(value).strip().lower() in _TRUE
+        return client.as_bool(value, default=default)
     if isinstance(default, int):
+        if isinstance(value, bool):                 # bool is an int: refuse rather than 1s
+            return default
         try:
             return int(value)
         except (TypeError, ValueError):

@@ -59,14 +59,19 @@ counters — so a run is auditable without reading the raw response.
 
 ## Config
 
-`web_research` reads three settings from `plugins.entries.deepseek-web-tools` (`hermes config set`):
+Four settings, under the `settings` subtree the loader actually reads — a value set anywhere else
+in the entry is ignored:
 
-| Key | Default | Meaning |
+```bash
+hermes config set plugins.entries.deepseek-web-tools.settings.thinking true
+```
+
+| Key (`plugins.entries.deepseek-web-tools.settings.*`) | Default | Meaning |
 |---|---|---|
 | `model` | `deepseek-flash` | The only model the vendor documents for the server tools. |
 | `thinking` | `false` | Default for every call. **Off on purpose:** the server default is *enabled*, and deep thinking search bills reasoning tokens plus up to ~20 searches. |
 | `with_read_url` | `true` | Also declare `deepseek_read_url` so URLs passed to the tool are read. Harmless when no URL is passed. |
-| `timeout_s` | `180` | Per-attempt HTTP timeout. |
+| `timeout_s` | `90` | Per-attempt HTTP timeout. Three attempts plus backoff bound one call at about 4.5 minutes; the plugin API exposes no `execution_timeout`, so the budget lives here. |
 
 ## Cost and limits
 
@@ -76,6 +81,11 @@ counters — so a run is auditable without reading the raw response.
   Overruns are HTTP 429; the client retries 408/429/5xx up to three times with backoff.
 - A `thinking=false` call is typically one search; `thinking=true` can reach ~20 billed calls.
   Choose accordingly — one deliberate deep call usually beats five shallow ones.
+- **"Not billed" is about the request, not the turn.** A search or fetch that never produced a
+  result is free, but a *generation* failure (HTTP 200 with an `error` body) still bills the
+  searches that already ran, and a retry after a 5xx re-runs the whole round: the vendor advises
+  retrying those, so the trade is a possible double charge on a rare path. `web_research` reports
+  the billed counters it was told about, so a suspicious run is checkable against the balance.
 
 ## Verify
 

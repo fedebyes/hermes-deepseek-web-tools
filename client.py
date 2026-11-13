@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 MAX_URLS = 10          # vendor: first 10 distinct URLs of the last user message are considered
-TIMEOUT_S = 180
+TIMEOUT_S = 90        # per attempt; 3 attempts + backoff bounds one call at ~4.5 min
+                      # (PluginContext.register_tool exposes no execution_timeout, so the
+                      # budget has to live here rather than in the tool registration)
 MAX_ATTEMPTS = 3
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -51,20 +53,31 @@ class WebToolsError(RuntimeError):
 # ─── key + endpoint ──────────────────────────────────────────────────────────
 
 def resolve_api_key() -> str | None:
-    """The key Hermes already holds for the model, never read from a file here."""
-    try:                                            # the plugin host's own resolver
-        from agent.web_search_provider import get_provider_env
-    except Exception:                               # standalone (tests, live accept)
-        return os.environ.get("DEEPSEEK_API_KEY") or None
+    """The key Hermes holds for this call, resolved with the caller's profile scope.
+
+    Inside the plugin host this goes through ``agent.secret_scope.get_secret``, which honours
+    the turn's profile scope and **raises** ``UnscopedSecretError`` when multiplexing is on and
+    no scope is installed. That raise is deliberately not caught: falling back to
+    ``os.environ`` here would hand the model call another profile's credential, which is the
+    exact failure the scope exists to prevent.
+
+    The ``os.environ`` read survives only for the standalone case - the test suite and
+    ``scripts/live_accept.py`` run outside a Hermes host, where ``agent`` is not importable.
+    """
     try:
-        return get_provider_env("DEEPSEEK_API_KEY") or None
-    except Exception:
+        from agent.secret_scope import get_secret
+    except ImportError:                             # standalone: no Hermes host on sys.path
         return os.environ.get("DEEPSEEK_API_KEY") or None
+    return get_secret("DEEPSEEK_API_KEY") or None
 
 
 def key_available() -> bool:
-    """``check_fn`` for the tool registry: hide the tool when the key is missing."""
-    return resolve_api_key() is not None
+    """``check_fn`` for the tool registry: hide the tool when the key is missing or unscoped."""
+    try:
+        return resolve_api_key() is not None
+    except Exception as exc:                        # UnscopedSecretError: hide, never widen
+        logger.debug("DEEPSEEK_API_KEY not resolvable in this scope: %s", exc)
+        return False
 
 
 def base_url() -> str:
@@ -100,6 +113,37 @@ def base_url() -> str:
 
 # ─── request ─────────────────────────────────────────────────────────────────
 
+def dedupe_urls(urls: list[str] | None) -> list[str]:
+    """Trim, drop empties and de-duplicate, keeping order — the vendor counts the first 10
+    *distinct* URLs, so a duplicate would spend a slot the model never gets to use."""
+    seen: set[str] = set()
+    picked: list[str] = []
+    for raw in urls or []:
+        url = str(raw).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        picked.append(url)
+        if len(picked) == MAX_URLS:
+            break
+    return picked
+
+
+def as_bool(value: Any, *, default: bool = False) -> bool:
+    """Coerce a tool argument or setting to a bool, treating "false" as false.
+
+    ``bool("false")`` is True, which would silently turn a one-search call into a deep
+    thinking search billed for up to ~20, so string forms are parsed explicitly.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def build_payload(
     *,
     query: str,
@@ -115,7 +159,7 @@ def build_payload(
     user message, so a URL that is not in the text is a URL the model never sees.
     """
     text = query.strip()
-    picked = [u.strip() for u in (urls or []) if u and u.strip()][:MAX_URLS]
+    picked = dedupe_urls(urls)
     if picked:
         text = f"{text}\n\nPages to read:\n" + "\n".join(picked)
 
@@ -205,7 +249,14 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
     """Flatten a chat-completion with server tools into what a caller can use."""
     choices = body.get("choices") or []
     if not choices:
-        raise WebToolsError("response carried no choices")
+        # A generation failure arrives as HTTP 200 with {"error": {...}, "usage": {...}}: the
+        # vendor's message is the actionable part ("please retry", a content refusal), and the
+        # searches that already ran were billed, so it must not be collapsed into "no choices".
+        error = body.get("error") or {}
+        detail = str(error.get("message") or "").strip() if isinstance(error, dict) else str(error)
+        code = error.get("code") if isinstance(error, dict) else None
+        reason = f"generation failed{f' ({code})' if code else ''}"
+        raise WebToolsError(f"{reason}: {detail}" if detail else reason)
     choice = choices[0] or {}
     message = choice.get("message") or {}
 
@@ -217,6 +268,7 @@ def parse_response(body: dict[str, Any]) -> dict[str, Any]:
                 "tool": (call or {}).get("type"),
                 "action": (call or {}).get("action"),
                 "status": (call or {}).get("status"),
+                "error": (call or {}).get("error"),
                 "page": (call or {}).get("page"),
                 "sources": (call or {}).get("sources"),
             })
@@ -263,6 +315,14 @@ def render(result: dict[str, Any], *, thinking: bool) -> str:
             counts[kind] = counts.get(kind, 0) + 1
         steps = " · ".join(f"{kind} ×{count}" for kind, count in sorted(counts.items()))
         parts.append(f"Server steps: {steps}")
+
+    failures = []
+    for call in calls:
+        if call.get("status") == "failed":
+            code = ((call.get("error") or {}) if isinstance(call.get("error"), dict) else {}).get("code")
+            failures.append(f"{call.get('kind') or '?'}: {code or 'failed'}")
+    if failures:
+        parts.append("Failed calls: " + ", ".join(failures))
 
     usage = (result.get("usage") or {}).get("server_tool_use") or {}
     if usage:
@@ -318,15 +378,14 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
     if args.get("thinking") is None:
         thinking = thinking_default
     else:
-        thinking = bool(args.get("thinking"))
+        thinking = as_bool(args.get("thinking"), default=thinking_default)
 
     urls = args.get("urls") or []
     if isinstance(urls, str):                       # tolerate a bare string
         urls = [urls]
-    urls = [str(u).strip() for u in urls if str(u).strip()]
-    dropped = len(urls) - MAX_URLS
-    if dropped > 0:
-        urls = urls[:MAX_URLS]
+    raw_urls = [str(u).strip() for u in urls if str(u).strip()]
+    urls = dedupe_urls(raw_urls)
+    dropped = len(raw_urls) - len(urls)
 
     image_url = (args.get("image_url") or "").strip() or None
 

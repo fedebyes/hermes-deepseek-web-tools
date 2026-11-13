@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: offline unit tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # The suite is stdlib unittest with the transport injected: no key, no network, no deps.
+      # It fails if a retry, an error mapping, a rendered field or the credential path regresses.
+      - name: unit tests
+        run: python tests/test_client.py
+      - name: both entry points compile
+        run: python -m compileall -q __init__.py client.py schema.py scripts/live_accept.py
