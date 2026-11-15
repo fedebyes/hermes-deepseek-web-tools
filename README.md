@@ -45,9 +45,9 @@ starts, so a session that was already running keeps the tool set it loaded at st
 Requires `DEEPSEEK_API_KEY` in the Hermes environment (the same key the model uses). Without it
 the tool hides itself (`check_fn`) instead of failing at call time.
 
-Requires Hermes **≥ 0.23.0** (`requires_hermes` in the manifest): the plugin is built against the
-`register_tool` and `get_config` signatures verified on 0.23.1, and an older host would fail at
-load rather than at call time.
+Requires Hermes **≥ 0.22.2** (`requires_hermes` in the manifest): the `register_tool` kwargs and
+`get_config` the plugin calls were verified on both 0.22.2 and 0.23.1, and an older host would fail
+at load rather than at call time.
 
 ## Tool
 
