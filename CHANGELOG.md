@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6
+
+- `requires_hermes` corrected to `>=0.22.2`. 1.0.5 declared `>=0.23.0` on the assumption that the
+  `register_tool` / `get_config` API arrived there; it did not — a 0.22.2 install has the same
+  signature (`hermes_cli/plugins.py`, `PluginContext.register_tool` with `check_fn`, `emoji`,
+  `override`) and `get_config`, so the higher floor only locked out working hosts.
+
 ## 1.0.5
 
 - `files`: local documents are asked about, not inlined. Each file is uploaded to the DeepSeek
