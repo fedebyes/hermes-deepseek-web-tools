@@ -1,11 +1,11 @@
 name: deepseek-web-tools
-version: "1.0.4"
+version: "1.0.5"
 manifest_version: 2
 description: "DeepSeek's server-side web tools as one tool: web_research answers a question from the live web with structured citations in a single call, and can carry local documents (PDF/Office/image, as `files`) for the question to be asked over. thinking is opt-in (the server default bills up to ~20 searches) and page text never comes back - use web_extract for content."
 author: Fedebyes
 license: MIT
 homepage: https://github.com/fedebyes/hermes-deepseek-web-tools
-requires_hermes: ">=0.22.5"
+requires_hermes: ">=0.23.0"  # verified on 0.23.1: register_tool kwargs + get_config
 provides_tools:
   - web_research
 optional_env:
@@ -13,7 +13,7 @@ optional_env:
     description: "Test seam only: the exact origin https://api.deepseek.com or a loopback host; anything else is refused and the default endpoint used."
 requires_env:
   - name: DEEPSEEK_API_KEY
-    description: "DeepSeek API key. Searches and fetches are billed per successful query ($0.75 / 1,000) — one search call with three queries counts as three."
+    description: "DeepSeek API key. Searches and fetches are billed per successful query — one search call with three queries counts as three. See the vendor's pricing page for the current rate."
     url: https://platform.deepseek.com/api_keys
     secret: true
 config_schema:

@@ -12,14 +12,17 @@ script can import it from its own path without a plugin host.
 
 from __future__ import annotations
 
-import base64
+import hashlib
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,8 @@ MAX_FILES = 3         # a second, bigger document is a second call, not a bigger
 MAX_FILE_BYTES = 8 * 1024 * 1024      # per file; the vendor answers 413 above its body limit
 MAX_FILES_TOTAL_BYTES = 12 * 1024 * 1024
 # What the vendor parses into context: PDFs and Office documents, plus images and plain text.
+# The purpose decides how: text_recognition gives the model the text only, rich_layout_recognition
+# gives it the figures too, user_data is the only purpose plain text/spreadsheets/images accept.
 _FILE_MIME: dict[str, str] = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -52,6 +57,24 @@ _FILE_MIME: dict[str, str] = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+_FILE_PURPOSE: dict[str, str] = {
+    ".pdf": "rich_layout_recognition",
+    ".docx": "rich_layout_recognition",
+    ".pptx": "rich_layout_recognition",
+    ".xlsx": "user_data",
+    ".txt": "user_data",
+    ".md": "user_data",
+    ".csv": "user_data",
+    ".png": "user_data",
+    ".jpg": "user_data",
+    ".jpeg": "user_data",
+    ".webp": "user_data",
+    ".gif": "user_data",
+}
+FILES_CACHE = Path(os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "hermes", "deepseek-web-tools-files.json"))
+FILES_CACHE_MAX_AGE_S = 30 * 86400    # uploads are permanent; a month is a sanity bound, not a TTL
 # Attaching a file means its bytes leave this machine for the vendor, so the paths that hold
 # credentials are refused outright - a cheap guard that does not depend on remembering.
 _REFUSED_PATH_PARTS = ("/.env", "/.ssh/", "/.gnupg/", "/.local/secrets/", "/.password-store/",
@@ -59,6 +82,7 @@ _REFUSED_PATH_PARTS = ("/.env", "/.ssh/", "/.gnupg/", "/.local/secrets/", "/.pas
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DETAIL_LIMIT = 300    # never let a vendor error body flood the context
+MAX_IMAGE_URL_CHARS = 8192   # the README promise: a URL longer than this is a mistake, not a page
 
 # Per-page outcomes (url_not_allowed, unavailable) arrive as call-level error codes on a 200,
 # never as an HTTP status on POST /chat/completions - so these hints stay about the request.
@@ -197,6 +221,26 @@ def clamp_timeout(value: Any, default: int = TIMEOUT_S) -> int:
     return max(MIN_TIMEOUT_S, min(seconds, MAX_TIMEOUT_S))
 
 
+def usable_image_url(value: Any) -> str | None:
+    """The one URL the vendor is trusted to fetch, or None.
+
+    README promises "an https URL … at most 8192 characters"; a promise the code must keep, or
+    a typo becomes a billed round trip and a 400. ``data:image/…`` is accepted because it is not
+    a fetch at all.
+    """
+    url = str(value or "").strip()
+    if not url:
+        return None
+    if len(url) > MAX_IMAGE_URL_CHARS:
+        logger.warning("image_url ignored: %d characters, over the %d limit",
+                       len(url), MAX_IMAGE_URL_CHARS)
+        return None
+    if not url.lower().startswith(("https://", "data:image/")):
+        logger.warning("image_url ignored: only https:// or a data:image/ URL is accepted")
+        return None
+    return url
+
+
 def as_bool(value: Any, *, default: bool = False) -> bool:
     """Coerce a tool argument or setting to a bool, treating "false" as false.
 
@@ -214,31 +258,146 @@ def as_bool(value: Any, *, default: bool = False) -> bool:
 
 def _looks_like_credentials(candidate: str) -> bool:
     """True for the paths nobody should ever hand to a third party, by name or by location."""
-    lowered = candidate.lower()
+    # A Windows host spells the same directory with backslashes: normalise before matching,
+    # or C:\Users\x\.local\secrets\key.pdf sails past a guard written for POSIX.
+    lowered = candidate.replace("\\", "/").lower()
     if os.path.basename(lowered).startswith(".env"):
         return True
     return any(part in lowered for part in _REFUSED_PATH_PARTS)
 
 
+def _cache_read(cache_path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_write(cache_path: Path, entries: dict[str, Any]) -> None:
+    """Best effort: a cache that cannot be written costs an upload, never a call."""
+    try:
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entries, indent=1, sort_keys=True), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.debug("file cache write failed: %s", exc)
+
+
+def _safe_filename(filename: str, suffix: str = "") -> str:
+    """A name that cannot break the multipart header, keeping the extension it came with.
+
+    The vendor only needs something readable: the real name can carry quotes, CR/LF and
+    non-ASCII, and interpolated raw it either truncates the header or injects a new one.
+    The stem is folded to ``[A-Za-z0-9._-]``; the suffix is re-appended from the caller,
+    because folding a Cyrillic or CJK stem to ``_`` and then stripping dots would send the
+    document as ``filename="pdf"`` — no extension at all.
+    """
+    stem = os.path.basename(filename)
+    if suffix and stem.lower().endswith(suffix.lower()):
+        stem = stem[: -len(suffix)]
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return f"{cleaned or 'file'}{suffix}"
+
+
+def _entry_time(entry: Any) -> int:
+    """A cache entry's timestamp, 0 when it is corrupt — a bad entry costs an upload, not a call."""
+    try:
+        return int((entry or {}).get("at") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _multipart(purpose: str, filename: str, mime: str, data: bytes) -> tuple[bytes, str]:
+    """The upload body. `purpose` goes BEFORE `file`: the vendor requires that order for documents."""
+    boundary = f"----deepseek-webtools-{uuid.uuid4().hex}"
+    chunks: list[bytes] = [
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="purpose"\r\n\r\n',
+        purpose.encode() + b"\r\n",
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(),
+        f"Content-Type: {mime}\r\n\r\n".encode(),
+        data,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ]
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_file(
+    *,
+    filename: str,
+    mime: str,
+    purpose: str,
+    data: bytes,
+    key: str,
+    base: str | None = None,
+    timeout: int = TIMEOUT_S,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> str:
+    """POST one file to the vendor's Files API and return its ``file-api-…`` id.
+
+    Documents cannot ride inside the chat request: `file_data` inline is accepted for images
+    only, and a PDF sent that way comes back 400. Upload, then reference the id.
+    """
+    url = f"{(base or base_url()).rstrip('/')}/files"
+    body, content_type = _multipart(purpose, _safe_filename(filename,
+                                                           os.path.splitext(filename)[1]),
+                                    mime, data)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": content_type, "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        hint = _ERROR_HINTS.get(exc.code, "the upload was refused")
+        raise WebToolsError(f"upload refused - HTTP {exc.code} ({hint}): "
+                            f"{_error_detail(exc)}") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise WebToolsError(f"upload failed - {type(exc).__name__}: {exc}") from None
+    file_id = str(((payload or {}).get("id") or "")).strip()
+    if not file_id.startswith("file-"):
+        raise WebToolsError("upload returned no file id")
+    return file_id
+
+
 def file_parts(
     paths: list[str] | None,
     *,
+    key: str | None = None,
+    base: str | None = None,
+    timeout: int = TIMEOUT_S,
     max_files: int = MAX_FILES,
     max_bytes: int = MAX_FILE_BYTES,
     max_total: int = MAX_FILES_TOTAL_BYTES,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    cache_path: Path | None = None,
 ) -> tuple[list[dict[str, str]], list[str]]:
-    """Turn local file paths into ``file`` content parts — the vendor's file input.
+    """Turn local file paths into ``file`` content parts, uploading each one to the Files API.
 
-    The vendor takes a base64 data URL (``file_data``) plus a ``filename``; there is no upload
-    step, so the bytes ride in the request body and the size caps are what stands between a
-    working call and a 413. Refusals are *reported*, never silent: a skipped file the model
-    cannot see is the difference between an answer about the document and a confident answer
-    about nothing. Credential paths are refused because attaching a file ships it to a third
-    party, and that decision should never be one forgotten path away.
+    A part is ``{"type": "file", "file_id": "file-api-…"}``: the vendor parses uploaded
+    documents into the context (``rich_layout_recognition`` keeps figures and tables, not just
+    text) and refuses them inline. Uploads are permanent, so the id is cached by content hash and
+    purpose — the same PDF asked about twice costs one upload, and a changed file hashes
+    differently and is uploaded again.
+
+    Refusals are *reported*, never silent: a skipped file the model cannot see is the difference
+    between an answer about the document and a confident answer about nothing. Credential paths
+    are refused because attaching a file ships it to a third party, and that decision should never
+    be one forgotten path away.
     """
     parts: list[dict[str, str]] = []
     notes: list[str] = []
     total = 0
+    now = int(time.time())
+    cache_path = Path(cache_path) if cache_path else FILES_CACHE
+    cache = _cache_read(cache_path)
 
     for raw in paths or []:
         path = str(raw).strip()
@@ -284,17 +443,42 @@ def file_parts(
                          f"{max_total} bytes")
             continue
         try:
-            with open(path, "rb") as handle:
-                encoded = base64.b64encode(handle.read()).decode("ascii")
+            with open(target, "rb") as handle:
+                data = handle.read()
         except OSError:
             notes.append(f"{path} skipped - not readable")
             continue
+
+        purpose = _FILE_PURPOSE.get(suffix, "user_data")
+        digest = hashlib.sha256(data).hexdigest()
+        cache_key = f"{digest}:{purpose}"
+        cached = cache.get(cache_key)
+        cached_id = str((cached or {}).get("id") or "") if isinstance(cached, dict) else ""
+        file_id = ""
+        if cached_id.startswith("file-") and now - _entry_time(cached) < FILES_CACHE_MAX_AGE_S:
+            file_id = cached_id
+        if not file_id:
+            if not key:
+                notes.append(f"{os.path.basename(path)} skipped - no API key available to upload it")
+                continue
+            try:
+                file_id = upload_file(filename=os.path.basename(target), mime=mime, purpose=purpose,
+                                      data=data, key=key, base=base, timeout=timeout, opener=opener)
+            except WebToolsError as exc:
+                notes.append(f"{os.path.basename(path)} skipped - {exc}")
+                continue
+            cache[cache_key] = {"id": file_id, "at": now}
         total += size
-        parts.append({
-            "type": "file",
-            "file_data": f"data:{mime};base64,{encoded}",
-            "filename": os.path.basename(target),
-        })
+        parts.append({"type": "file", "file_id": file_id})
+
+    stale = [k for k, v in cache.items()
+             if not isinstance(v, dict) or now - _entry_time(v) >= FILES_CACHE_MAX_AGE_S]
+    if stale:
+        for key_ in stale:
+            cache.pop(key_, None)
+        _cache_write(cache_path, cache)
+    elif parts:
+        _cache_write(cache_path, cache)
 
     return parts, notes
 
@@ -321,10 +505,11 @@ def build_payload(
         text = f"{text}\n\nPages to read:\n" + "\n".join(picked)
 
     content: Any = text
-    if image_url or files:
+    image = usable_image_url(image_url)
+    if image or files:
         content = [{"type": "text", "text": text}]
-        if image_url:
-            content.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+        if image:
+            content.append({"type": "image_url", "image_url": {"url": image}})
         content.extend(files or [])
 
     tools: list[dict[str, str]] = [{"type": "deepseek_web_search"}]
@@ -555,7 +740,13 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
         raw_files = [raw_files]
     elif isinstance(raw_files, dict):               # a mapping would otherwise iterate its keys
         raw_files = list(raw_files.values())
-    parts, file_notes = file_parts([str(p) for p in raw_files])
+    try:
+        upload_key = resolve_api_key()              # documents need an upload before the call
+    except Exception as exc:                        # an unscoped read must not crash the turn
+        logger.debug("file upload key unavailable: %s", exc)
+        upload_key = None
+    parts, file_notes = file_parts([str(p) for p in raw_files], key=upload_key,
+                                  timeout=clamp_timeout(timeout))
 
     try:
         result = research(query, urls=urls or None, image_url=image_url, files=parts or None,

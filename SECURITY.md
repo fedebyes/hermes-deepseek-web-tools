@@ -14,6 +14,7 @@ dynamic, and cannot act without a tool call from the model.
 | Endpoint | When | Credential |
 |---|---|---|
 | `POST https://api.deepseek.com/chat/completions` | one per `web_research` call | `Authorization: Bearer $DEEPSEEK_API_KEY` |
+| `POST https://api.deepseek.com/files` | one per document named in `files`, once per distinct content | same key, same origin |
 
 Nothing else is contacted — no telemetry, no update check, no vendor SDK. The prompt text, any
 URLs/images you pass and **the bytes of any file named in `files`** are sent to DeepSeek, which is
@@ -32,8 +33,15 @@ the point of the tool: treat a query as public content and do not put secrets in
   cannot be told apart from the original, and a caller who deliberately points the tool at a
   secret is doing exactly what the argument says. The guard exists so that an accident — or an
   injected instruction — cannot quietly ship a keyring.
-- Encoded as a base64 `data:` URL in the request body, held in memory only — the plugin writes no
-  temporary file and logs neither the path nor the contents.
+- Uploaded to the Files API, not inlined: the vendor refuses documents in a chat request. The
+  name goes over the wire **sanitised** (`[^A-Za-z0-9._-]` folded to `_`) — it is a label for
+  the vendor, never a header that can be split on a quote or a newline.
+- The returned `file-id` is cached in `~/.local/state/hermes/deepseek-web-tools-files.json`
+  (mode `0600`) keyed by `sha256(content):purpose`. The file stores the id and a timestamp —
+  **no path, no file name, no content** — and an entry older than 30 days is dropped. The plugin
+  writes no temporary copy of the file and logs neither its path nor its contents.
+- Uploads are permanent on the vendor's side: there is no delete call, so a document sent once
+  stays there. Do not pass a file you would not be willing to publish.
 
 ## The API key
 
@@ -60,7 +68,9 @@ so there is deliberately no escape hatch: anyone who can set one variable can se
 - **No hooks.** No `pre_tool_call`, no `pre_llm_call`, no `on_session_*` — this plugin cannot see,
   rewrite or veto anything else the agent does.
 - **No overrides.** `web_research` is a new name; it replaces no built-in tool.
-- **No side effects outside the response.** No writes, no `subprocess`, no `eval`, no dynamic
+- **No side effects outside the response**, with exactly one exception: the upload-id cache under
+  `~/.local/state/hermes/` — id and timestamp only, mode `0600` — which is what keeps a second
+  question about the same document from uploading it again. No `subprocess`, no `eval`, no dynamic
   imports.
 - Failures are returned as a short string (`web_research failed: …`) and never raised: a plugin that
   throws inside a tool handler breaks the agent loop.
@@ -81,11 +91,16 @@ a page can carry instructions aimed at the model ("ignore your rules and…"). T
 
 - Treat a `web_research` result as untrusted content, not as an instruction. It is data with
   sources attached, and the sources are what make it checkable.
+- **A document passed in `files` is the same channel.** The vendor parses it and its text reaches
+  the model as context, so a document chosen by an injected instruction — or forwarded from an
+  untrusted sender — is untrusted content with no source to check against. Never let a web page
+  decide which local document gets read.
 - The tool grants no capability of its own: it cannot write files, run commands or spawn anything.
   An injected instruction that reaches the agent still has to pass the same approval layers as any
   other model decision — which is why this plugin declares no hooks and no tool overrides.
 
 ## Reporting
 
-Open an issue at https://github.com/fedebyes/hermes-deepseek-web-tools/issues. Please do not paste
-API keys, full request bodies or private URLs into a report.
+Open an issue at https://github.com/fedebyes/hermes-deepseek-web-tools/issues, or use **GitHub →
+Security → Report a vulnerability** for a private advisory. Please do not paste API keys, full
+request bodies or private URLs into a report.

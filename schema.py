@@ -61,10 +61,11 @@ WEB_RESEARCH_SCHEMA = _schema(
             "maxItems": 3,
             "description": "Optional local documents to ask the question *about*: absolute paths "
                            "to PDF, DOCX/XLSX/PPTX, .txt/.md/.csv or an image, at most 3 files "
-                           "and 8 MB each. The vendor parses them into the context (layouts and "
-                           "tables included), so this replaces extracting the text yourself. "
-                           "The file's bytes are sent to DeepSeek: never pass credentials, and "
-                           "prefer a small extract over a huge scan.",
+                           "and 8 MB each. Each file is uploaded to the DeepSeek Files API first "
+                           "and referenced by id, so the vendor parses layouts and tables into "
+                           "the context - no local extraction needed. The file's bytes are sent "
+                           "to DeepSeek: never pass credentials, and prefer a small extract over "
+                           "a huge scan.",
         },
         "thinking": {
             "type": "boolean",
