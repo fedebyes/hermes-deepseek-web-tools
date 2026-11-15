@@ -18,6 +18,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 import urllib.error
@@ -141,6 +142,112 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(content[0], {"type": "text", "text": "what is this"})
         self.assertEqual(content[1], {"type": "image_url",
                                       "image_url": {"url": "https://example.com/a.jpg"}})
+
+
+# ─── file input ─────────────────────────────────────────────────────────────
+
+class FileInputTests(unittest.TestCase):
+    """``files`` is the vendor's document input: base64 data URL + filename, never silent drops."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, name: str, size: int = 16, contents: bytes | None = None) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as handle:
+            handle.write(contents if contents is not None else b"x" * size)
+        return path
+
+    def test_a_pdf_becomes_a_file_part_with_its_data_url_and_name(self):
+        path = self._write("report.pdf", contents=b"%PDF-1.4 fake")
+        parts, notes = client.file_parts([path])
+        self.assertEqual(notes, [])
+        self.assertEqual(len(parts), 1)
+        part = parts[0]
+        self.assertEqual(part["type"], "file")
+        self.assertEqual(part["filename"], "report.pdf")
+        self.assertTrue(part["file_data"].startswith("data:application/pdf;base64,"))
+        import base64 as _b64
+        encoded = part["file_data"].split(",", 1)[1]
+        self.assertEqual(_b64.b64decode(encoded), b"%PDF-1.4 fake")
+
+    def test_office_and_image_types_carry_their_own_mime(self):
+        docx = self._write("a.docx")
+        png = self._write("b.png")
+        parts, notes = client.file_parts([docx, png])
+        self.assertEqual(notes, [])
+        self.assertIn("wordprocessingml.document", parts[0]["file_data"][:80])
+        self.assertTrue(parts[1]["file_data"].startswith("data:image/png;base64,"))
+
+    def test_a_relative_path_is_refused_with_a_reason(self):
+        parts, notes = client.file_parts(["report.pdf"])
+        self.assertEqual(parts, [])
+        self.assertIn("absolute path is required", notes[0])
+
+    def test_an_unsupported_extension_is_refused_and_the_allowed_ones_named(self):
+        path = self._write("archive.zip")
+        parts, notes = client.file_parts([path])
+        self.assertEqual(parts, [])
+        self.assertIn("unsupported type", notes[0])
+        self.assertIn(".pdf", notes[0])
+
+    def test_a_file_over_the_size_cap_is_refused_not_truncated(self):
+        path = self._write("big.pdf", size=client.MAX_FILE_BYTES + 1)
+        parts, notes = client.file_parts([path])
+        self.assertEqual(parts, [])
+        self.assertIn("over the", notes[0])
+
+    def test_an_empty_file_is_refused(self):
+        path = self._write("empty.pdf", contents=b"")
+        parts, notes = client.file_parts([path])
+        self.assertEqual(parts, [])
+        self.assertIn("empty file", notes[0])
+
+    def test_a_missing_file_is_refused(self):
+        parts, notes = client.file_parts([os.path.join(self.tmp.name, "nope.pdf")])
+        self.assertEqual(parts, [])
+        self.assertTrue(notes)
+
+    def test_credentials_are_never_attached(self):
+        dotenv = self._write(".env", contents=b"SECRET=1\n")
+        nested = os.path.join(self.tmp.name, ".local", "secrets", "key.txt")
+        os.makedirs(os.path.dirname(nested), exist_ok=True)
+        with open(nested, "w", encoding="utf-8") as handle:
+            handle.write("s\n")
+        parts, notes = client.file_parts([dotenv, nested])
+        self.assertEqual(parts, [])
+        self.assertEqual(len(notes), 2)
+        for note in notes:
+            self.assertIn("credentials are never attached", note)
+        # nothing was read: an empty part list is the assertion that the bytes never left
+        self.assertEqual(parts, [])
+
+    def test_at_most_three_files_and_the_extras_are_reported(self):
+        paths = [self._write(f"f{i}.txt") for i in range(5)]
+        parts, notes = client.file_parts(paths)
+        self.assertEqual(len(parts), client.MAX_FILES)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("at most 3 files", notes[0])
+
+    def test_the_total_payload_cap_is_enforced(self):
+        big = self._write("a.pdf", size=client.MAX_FILE_BYTES)
+        second = self._write("b.pdf", size=client.MAX_FILE_BYTES)
+        parts, notes = client.file_parts([big, second])
+        self.assertEqual(len(parts), 1)
+        self.assertIn("would put the payload over", notes[0])
+
+    def test_file_parts_follow_the_text_in_the_payload(self):
+        path = self._write("report.pdf")
+        parts, _ = client.file_parts([path])
+        content = client.build_payload(query="summarise this", files=parts)["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0], {"type": "text", "text": "summarise this"})
+        self.assertEqual(content[1]["type"], "file")
+
+    def test_no_files_keeps_the_plain_string_content(self):
+        content = client.build_payload(query="q")["messages"][0]["content"]
+        self.assertEqual(content, "q")
 
 
 # ─── endpoint guard ─────────────────────────────────────────────────────────
@@ -294,6 +401,30 @@ class RunTests(unittest.TestCase):
     def test_accepts_a_bare_string_url(self):
         captured, _ = self._capture({"query": "q", "urls": "https://example.com/x"})
         self.assertEqual(captured["urls"], ["https://example.com/x"])
+
+    def test_files_are_encoded_and_passed_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "notes.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("hello")
+            captured, out = self._capture({"query": "q", "files": [path]})
+        self.assertEqual(len(captured["files"]), 1)
+        self.assertEqual(captured["files"][0]["filename"], "notes.txt")
+        self.assertTrue(captured["files"][0]["file_data"].startswith("data:text/plain;base64,"))
+        self.assertNotIn("skipped", out)
+
+    def test_a_refused_file_is_reported_in_the_answer(self):
+        captured, out = self._capture({"query": "q", "files": ["relative.txt"]})
+        self.assertIsNone(captured.get("files"))
+        self.assertIn("skipped - an absolute path is required", out)
+
+    def test_a_bare_string_file_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "one.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            captured, _ = self._capture({"query": "q", "files": path})
+        self.assertEqual(len(captured["files"]), 1)
 
 
 # ─── credential scope ───────────────────────────────────────────────────────
