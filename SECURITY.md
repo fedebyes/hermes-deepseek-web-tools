@@ -14,6 +14,7 @@ dynamic, and cannot act without a tool call from the model.
 | Endpoint | When | Credential |
 |---|---|---|
 | `POST https://api.deepseek.com/chat/completions` | one per `web_research` call | `Authorization: Bearer $DEEPSEEK_API_KEY` |
+| `POST https://api.deepseek.com/files` | one per document named in `files`, once per distinct content | same key, same origin |
 
 Nothing else is contacted — no telemetry, no update check, no vendor SDK. The prompt text, any
 URLs/images you pass and **the bytes of any file named in `files`** are sent to DeepSeek, which is
@@ -32,8 +33,11 @@ the point of the tool: treat a query as public content and do not put secrets in
   cannot be told apart from the original, and a caller who deliberately points the tool at a
   secret is doing exactly what the argument says. The guard exists so that an accident — or an
   injected instruction — cannot quietly ship a keyring.
-- Encoded as a base64 `data:` URL in the request body, held in memory only — the plugin writes no
-  temporary file and logs neither the path nor the contents.
+- Uploaded to the Files API, not inlined: the vendor refuses documents in a chat request.
+  The returned `file-id` is cached in `~/.local/state/hermes/deepseek-web-tools-files.json`
+  keyed by content hash and purpose — the file name and the path are stored nowhere, and an
+  entry older than 30 days is dropped. The plugin writes no temporary copy of the file and
+  logs neither its path nor its contents.
 
 ## The API key
 

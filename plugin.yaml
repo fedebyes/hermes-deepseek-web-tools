@@ -1,5 +1,5 @@
 name: deepseek-web-tools
-version: "1.0.4"
+version: "1.0.5"
 manifest_version: 2
 description: "DeepSeek's server-side web tools as one tool: web_research answers a question from the live web with structured citations in a single call, and can carry local documents (PDF/Office/image, as `files`) for the question to be asked over. thinking is opt-in (the server default bills up to ~20 searches) and page text never comes back - use web_extract for content."
 author: Fedebyes

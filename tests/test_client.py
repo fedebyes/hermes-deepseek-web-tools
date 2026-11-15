@@ -147,11 +147,23 @@ class PayloadTests(unittest.TestCase):
 # ─── file input ─────────────────────────────────────────────────────────────
 
 class FileInputTests(unittest.TestCase):
-    """``files`` is the vendor's document input: base64 data URL + filename, never silent drops."""
+    """``files`` is the vendor's document input: upload first, then reference the ``file_id``."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.cache = Path(self.tmp.name) / "files.json"
+
+    def _parts(self, paths, ids=("file-api-test-1",), **kwargs):
+        """Run file_parts against a scripted Files API; requests are the wire evidence."""
+        opener = _opener(*[{"id": file_id} for file_id in ids])
+        parts, notes = client.file_parts(paths, key="k", opener=opener,
+                                         cache_path=self.cache, **kwargs)
+        return parts, notes, opener.seen
+
+    @staticmethod
+    def _form(request) -> bytes:
+        return request.data if isinstance(request.data, bytes) else bytes(request.data)
 
     def _write(self, name: str, size: int = 16, contents: bytes | None = None) -> str:
         path = os.path.join(self.tmp.name, name)
@@ -159,26 +171,60 @@ class FileInputTests(unittest.TestCase):
             handle.write(contents if contents is not None else b"x" * size)
         return path
 
-    def test_a_pdf_becomes_a_file_part_with_its_data_url_and_name(self):
+    def test_a_pdf_is_uploaded_and_referenced_by_file_id(self):
         path = self._write("report.pdf", contents=b"%PDF-1.4 fake")
-        parts, notes = client.file_parts([path])
+        parts, notes, sent = self._parts([path])
         self.assertEqual(notes, [])
-        self.assertEqual(len(parts), 1)
-        part = parts[0]
-        self.assertEqual(part["type"], "file")
-        self.assertEqual(part["filename"], "report.pdf")
-        self.assertTrue(part["file_data"].startswith("data:application/pdf;base64,"))
-        import base64 as _b64
-        encoded = part["file_data"].split(",", 1)[1]
-        self.assertEqual(_b64.b64decode(encoded), b"%PDF-1.4 fake")
+        self.assertEqual(parts, [{"type": "file", "file_id": "file-api-test-1"}])
+        self.assertEqual(len(sent), 1)
+        body = self._form(sent[0])
+        self.assertEqual(sent[0].full_url, f"{client.base_url()}/files")
+        self.assertIn(b'name="purpose"', body)
+        # the vendor requires the purpose field before the file field for documents
+        self.assertLess(body.index(b'name="purpose"'), body.index(b'name="file"'))
+        self.assertIn(b"rich_layout_recognition", body)
+        self.assertIn(b'filename="report.pdf"', body)
+        self.assertIn(b"%PDF-1.4 fake", body)
 
-    def test_office_and_image_types_carry_their_own_mime(self):
+    def test_the_purpose_follows_the_file_type(self):
         docx = self._write("a.docx")
         png = self._write("b.png")
-        parts, notes = client.file_parts([docx, png])
+        parts, notes, sent = self._parts([docx, png], ids=("file-api-1", "file-api-2"))
         self.assertEqual(notes, [])
-        self.assertIn("wordprocessingml.document", parts[0]["file_data"][:80])
-        self.assertTrue(parts[1]["file_data"].startswith("data:image/png;base64,"))
+        self.assertEqual([p["file_id"] for p in parts], ["file-api-1", "file-api-2"])
+        first, second = (self._form(request) for request in sent)
+        self.assertIn(b"rich_layout_recognition", first)      # Word: text AND figures
+        self.assertIn(b'application/vnd.openxmlformats', first)
+        self.assertIn(b"user_data", second)                   # images take user_data only
+        self.assertIn(b"image/png", second)
+
+    def test_the_same_file_is_uploaded_once_and_a_changed_one_again(self):
+        path = self._write("report.pdf", contents=b"%PDF-v1")
+        self._parts([path])
+        parts, notes, sent = self._parts([path])               # unchanged -> cache hit
+        self.assertEqual(parts, [{"type": "file", "file_id": "file-api-test-1"}])
+        self.assertEqual(sent, [])
+        self._write("report.pdf", contents=b"%PDF-v2-changed")
+        _, _, sent = self._parts([path])                       # content changed -> new upload
+        self.assertEqual(len(sent), 1)
+
+    def test_a_missing_key_leaves_the_file_out_and_says_so(self):
+        path = self._write("report.pdf")
+        opener = _opener({"id": "file-api-never"})
+        parts, notes = client.file_parts([path], key=None, opener=opener,
+                                         cache_path=self.cache)
+        self.assertEqual(parts, [])
+        self.assertIn("no API key available to upload", notes[0])
+        self.assertEqual(opener.seen, [])
+
+    def test_an_upload_refusal_is_reported_not_raised(self):
+        path = self._write("report.pdf")
+        opener = _opener(403)                                  # the vendor refuses this upload
+        parts, notes = client.file_parts([path], key="k", opener=opener,
+                                         cache_path=self.cache)
+        self.assertEqual(parts, [])
+        self.assertIn("skipped - upload refused", notes[0])
+        self.assertIn("HTTP 403", notes[0])
 
     def test_a_relative_path_is_refused_with_a_reason(self):
         parts, notes = client.file_parts(["report.pdf"])
@@ -236,13 +282,14 @@ class FileInputTests(unittest.TestCase):
         self.assertEqual(parts, [])
         self.assertIn("credentials are never attached", notes[0])
 
-    def test_a_legit_symlink_resolves_and_reports_the_target_name(self):
+    def test_a_legit_symlink_resolves_and_uploads_the_target_name(self):
         real = self._write("real.pdf")
         link = os.path.join(self.tmp.name, "alias.pdf")
         os.symlink(real, link)
-        parts, notes = client.file_parts([link])
+        parts, notes, sent = self._parts([link])
         self.assertEqual(notes, [])
-        self.assertEqual(parts[0]["filename"], "real.pdf")
+        self.assertEqual(len(parts), 1)
+        self.assertIn(b'filename="real.pdf"', self._form(sent[0]))
 
     def test_a_dot_env_symlink_is_refused(self):
         env_file = self._write("dotenv-source", contents=b"SECRET=1\n")
@@ -254,7 +301,7 @@ class FileInputTests(unittest.TestCase):
 
     def test_at_most_three_files_and_the_extras_are_reported(self):
         paths = [self._write(f"f{i}.txt") for i in range(5)]
-        parts, notes = client.file_parts(paths)
+        parts, notes, _ = self._parts(paths, ids=tuple(f"file-api-{i}" for i in range(5)))
         self.assertEqual(len(parts), client.MAX_FILES)
         self.assertEqual(len(notes), 2)
         self.assertIn("at most 3 files", notes[0])
@@ -262,17 +309,17 @@ class FileInputTests(unittest.TestCase):
     def test_the_total_payload_cap_is_enforced(self):
         big = self._write("a.pdf", size=client.MAX_FILE_BYTES)
         second = self._write("b.pdf", size=client.MAX_FILE_BYTES)
-        parts, notes = client.file_parts([big, second])
+        parts, notes, _ = self._parts([big, second])
         self.assertEqual(len(parts), 1)
         self.assertIn("would put the payload over", notes[0])
 
     def test_file_parts_follow_the_text_in_the_payload(self):
         path = self._write("report.pdf")
-        parts, _ = client.file_parts([path])
+        parts, _, _ = self._parts([path])
         content = client.build_payload(query="summarise this", files=parts)["messages"][0]["content"]
         self.assertIsInstance(content, list)
         self.assertEqual(content[0], {"type": "text", "text": "summarise this"})
-        self.assertEqual(content[1]["type"], "file")
+        self.assertEqual(content[1], {"type": "file", "file_id": "file-api-test-1"})
 
     def test_no_files_keeps_the_plain_string_content(self):
         content = client.build_payload(query="q")["messages"][0]["content"]
@@ -431,15 +478,24 @@ class RunTests(unittest.TestCase):
         captured, _ = self._capture({"query": "q", "urls": "https://example.com/x"})
         self.assertEqual(captured["urls"], ["https://example.com/x"])
 
-    def test_files_are_encoded_and_passed_through(self):
+    def test_files_are_uploaded_and_passed_as_file_ids(self):
+        import hashlib
+        import time as _time
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "notes.txt")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("hello")
-            captured, out = self._capture({"query": "q", "files": [path]})
-        self.assertEqual(len(captured["files"]), 1)
-        self.assertEqual(captured["files"][0]["filename"], "notes.txt")
-        self.assertTrue(captured["files"][0]["file_data"].startswith("data:text/plain;base64,"))
+            cache = Path(tmp) / "files.json"
+            digest = hashlib.sha256(b"hello").hexdigest()
+            cache.write_text(json.dumps({f"{digest}:user_data":
+                                         {"id": "file-api-cached", "at": int(_time.time())}}))
+            original_cache = client.FILES_CACHE
+            client.FILES_CACHE = cache
+            try:
+                captured, out = self._capture({"query": "q", "files": [path]})
+            finally:
+                client.FILES_CACHE = original_cache
+        self.assertEqual(captured["files"], [{"type": "file", "file_id": "file-api-cached"}])
         self.assertNotIn("skipped", out)
 
     def test_a_refused_file_is_reported_in_the_answer(self):
@@ -452,8 +508,11 @@ class RunTests(unittest.TestCase):
             path = os.path.join(tmp, "one.txt")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("x")
-            captured, _ = self._capture({"query": "q", "files": path})
-        self.assertEqual(len(captured["files"]), 1)
+            # no key here: the point is the string is accepted as a path, not that it uploads
+            captured, out = self._capture({"query": "q", "files": path})
+        self.assertIsNone(captured.get("files"))
+        self.assertIn("one.txt", out)
+        self.assertNotIn("absolute path is required", out)
 
 
 # ─── credential scope ───────────────────────────────────────────────────────
