@@ -71,7 +71,9 @@ _FILE_PURPOSE: dict[str, str] = {
     ".webp": "user_data",
     ".gif": "user_data",
 }
-FILES_CACHE = Path(os.path.expanduser("~/.local/state/hermes/deepseek-web-tools-files.json"))
+FILES_CACHE = Path(os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "hermes", "deepseek-web-tools-files.json"))
 FILES_CACHE_MAX_AGE_S = 30 * 86400    # uploads are permanent; a month is a sanity bound, not a TTL
 # Attaching a file means its bytes leave this machine for the vendor, so the paths that hold
 # credentials are refused outright - a cheap guard that does not depend on remembering.
@@ -80,6 +82,7 @@ _REFUSED_PATH_PARTS = ("/.env", "/.ssh/", "/.gnupg/", "/.local/secrets/", "/.pas
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DETAIL_LIMIT = 300    # never let a vendor error body flood the context
+MAX_IMAGE_URL_CHARS = 8192   # the README promise: a URL longer than this is a mistake, not a page
 
 # Per-page outcomes (url_not_allowed, unavailable) arrive as call-level error codes on a 200,
 # never as an HTTP status on POST /chat/completions - so these hints stay about the request.
@@ -218,6 +221,26 @@ def clamp_timeout(value: Any, default: int = TIMEOUT_S) -> int:
     return max(MIN_TIMEOUT_S, min(seconds, MAX_TIMEOUT_S))
 
 
+def usable_image_url(value: Any) -> str | None:
+    """The one URL the vendor is trusted to fetch, or None.
+
+    README promises "an https URL … at most 8192 characters"; a promise the code must keep, or
+    a typo becomes a billed round trip and a 400. ``data:image/…`` is accepted because it is not
+    a fetch at all.
+    """
+    url = str(value or "").strip()
+    if not url:
+        return None
+    if len(url) > MAX_IMAGE_URL_CHARS:
+        logger.warning("image_url ignored: %d characters, over the %d limit",
+                       len(url), MAX_IMAGE_URL_CHARS)
+        return None
+    if not url.lower().startswith(("https://", "data:image/")):
+        logger.warning("image_url ignored: only https:// or a data:image/ URL is accepted")
+        return None
+    return url
+
+
 def as_bool(value: Any, *, default: bool = False) -> bool:
     """Coerce a tool argument or setting to a bool, treating "false" as false.
 
@@ -235,7 +258,9 @@ def as_bool(value: Any, *, default: bool = False) -> bool:
 
 def _looks_like_credentials(candidate: str) -> bool:
     """True for the paths nobody should ever hand to a third party, by name or by location."""
-    lowered = candidate.lower()
+    # A Windows host spells the same directory with backslashes: normalise before matching,
+    # or C:\Users\x\.local\secrets\key.pdf sails past a guard written for POSIX.
+    lowered = candidate.replace("\\", "/").lower()
     if os.path.basename(lowered).startswith(".env"):
         return True
     return any(part in lowered for part in _REFUSED_PATH_PARTS)
@@ -261,13 +286,19 @@ def _cache_write(cache_path: Path, entries: dict[str, Any]) -> None:
 
 
 def _safe_filename(filename: str, suffix: str = "") -> str:
-    """A name that cannot break the multipart header.
+    """A name that cannot break the multipart header, keeping the extension it came with.
 
     The vendor only needs something readable: the real name can carry quotes, CR/LF and
     non-ASCII, and interpolated raw it either truncates the header or injects a new one.
+    The stem is folded to ``[A-Za-z0-9._-]``; the suffix is re-appended from the caller,
+    because folding a Cyrillic or CJK stem to ``_`` and then stripping dots would send the
+    document as ``filename="pdf"`` — no extension at all.
     """
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._-")
-    return cleaned or f"file{suffix}"
+    stem = os.path.basename(filename)
+    if suffix and stem.lower().endswith(suffix.lower()):
+        stem = stem[: -len(suffix)]
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return f"{cleaned or 'file'}{suffix}"
 
 
 def _entry_time(entry: Any) -> int:
@@ -474,10 +505,11 @@ def build_payload(
         text = f"{text}\n\nPages to read:\n" + "\n".join(picked)
 
     content: Any = text
-    if image_url or files:
+    image = usable_image_url(image_url)
+    if image or files:
         content = [{"type": "text", "text": text}]
-        if image_url:
-            content.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+        if image:
+            content.append({"type": "image_url", "image_url": {"url": image}})
         content.extend(files or [])
 
     tools: list[dict[str, str]] = [{"type": "deepseek_web_search"}]

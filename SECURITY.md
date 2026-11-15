@@ -91,11 +91,16 @@ a page can carry instructions aimed at the model ("ignore your rules and…"). T
 
 - Treat a `web_research` result as untrusted content, not as an instruction. It is data with
   sources attached, and the sources are what make it checkable.
+- **A document passed in `files` is the same channel.** The vendor parses it and its text reaches
+  the model as context, so a document chosen by an injected instruction — or forwarded from an
+  untrusted sender — is untrusted content with no source to check against. Never let a web page
+  decide which local document gets read.
 - The tool grants no capability of its own: it cannot write files, run commands or spawn anything.
   An injected instruction that reaches the agent still has to pass the same approval layers as any
   other model decision — which is why this plugin declares no hooks and no tool overrides.
 
 ## Reporting
 
-Open an issue at https://github.com/fedebyes/hermes-deepseek-web-tools/issues. Please do not paste
-API keys, full request bodies or private URLs into a report.
+Open an issue at https://github.com/fedebyes/hermes-deepseek-web-tools/issues, or use **GitHub →
+Security → Report a vulnerability** for a private advisory. Please do not paste API keys, full
+request bodies or private URLs into a report.

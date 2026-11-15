@@ -144,6 +144,16 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(content[1], {"type": "image_url",
                                       "image_url": {"url": "https://example.com/a.jpg"}})
 
+    def test_an_image_url_the_vendor_cannot_fetch_is_dropped(self):
+        """README promises https or data:image, ≤8192 chars; the code keeps the promise."""
+        for bad in ("file:///etc/passwd", "http://example.com/a.jpg", "ftp://x/a.jpg",
+                    "https://example.com/" + "a" * 9000, "javascript:alert(1)"):
+            content = client.build_payload(query="q", image_url=bad)["messages"][0]["content"]
+            self.assertEqual(content, "q", bad)          # no image block, no key in the payload
+        inline = "data:image/png;base64,AAAA"
+        content = client.build_payload(query="q", image_url=inline)["messages"][0]["content"]
+        self.assertEqual(content[1], {"type": "image_url", "image_url": {"url": inline}})
+
 
 # ─── file input ─────────────────────────────────────────────────────────────
 
@@ -252,9 +262,19 @@ class FileInputTests(unittest.TestCase):
         self.assertIn("empty file", notes[0])
 
     def test_a_missing_file_is_refused(self):
-        parts, notes = client.file_parts([os.path.join(self.tmp.name, "nope.pdf")])
+        path = os.path.join(self.tmp.name, "nope.pdf")
+        parts, notes, sent = self._parts([path])
         self.assertEqual(parts, [])
-        self.assertTrue(notes)
+        self.assertEqual(sent, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("not readable", notes[0])     # the reason, not merely "some refusal"
+        self.assertIn("nope.pdf", notes[0])
+
+    def test_a_windows_spelling_of_a_credential_directory_is_refused(self):
+        """The guard is a policy on paths; a backslash is the same path."""
+        self.assertTrue(client._looks_like_credentials("C:\\Users\\x\\.local\\secrets\\a.pdf"))
+        self.assertTrue(client._looks_like_credentials("C:\\Users\\x\\.ssh\\id_rsa.pdf"))
+        self.assertFalse(client._looks_like_credentials("C:\\Users\\x\\Documents\\a.pdf"))
 
     def test_credentials_are_never_attached(self):
         dotenv = self._write(".env", contents=b"SECRET=1\n")
@@ -330,6 +350,50 @@ class FileInputTests(unittest.TestCase):
         # the header line ends where it should: the injected text lives inside the name, not as a header
         header_line = [line for line in body.split(b"\r\n") if b"filename=" in line][0]
         self.assertNotIn(b":", header_line.split(b"filename=")[1])
+
+    def test_a_non_latin_name_keeps_its_extension(self):
+        """Folding a Cyrillic or CJK stem to '_' must not eat the '.pdf' with it."""
+        cases = {"тест.pdf": ".pdf", "日本語の文書.pdf": ".pdf", "résumé.docx": ".docx",
+                 "Ω-results.csv": ".csv"}
+        for index, (name, suffix) in enumerate(cases.items()):
+            path = self._write(name, contents=f"%PDF-{index}".encode())   # distinct, or the cache dedupes
+            parts, notes, sent = self._parts([path])
+            self.assertEqual(notes, [], name)
+            body = self._form(sent[0])
+            sent_name = re.search(rb'filename="([^"]*)"', body).group(1).decode()
+            self.assertTrue(sent_name.endswith(suffix), f"{name} -> {sent_name}")
+            self.assertNotEqual(sent_name, suffix.lstrip("."), f"{name} -> {sent_name}")
+
+    def test_an_expired_entry_is_not_trusted_and_an_unrelated_stale_one_is_pruned(self):
+        """The 30-day bound is a claim in SECURITY.md, so it is asserted, not assumed."""
+        import hashlib
+        import time as _time
+        path = self._write("old.pdf", contents=b"%PDF-old")
+        digest = hashlib.sha256(b"%PDF-old").hexdigest()
+        stale_at = int(_time.time()) - 31 * 86400
+        other = "0" * 64 + ":user_data"
+        self.cache.write_text(json.dumps({
+            f"{digest}:rich_layout_recognition": {"id": "file-api-stale", "at": stale_at},
+            other: {"id": "file-api-other", "at": stale_at},
+        }), encoding="utf-8")
+        parts, notes, sent = self._parts([path])
+        self.assertEqual(len(sent), 1)                     # the 31-day-old id was not trusted
+        self.assertEqual(parts[0]["file_id"], "file-api-test-1")
+        remaining = json.loads(self.cache.read_text(encoding="utf-8"))
+        self.assertNotIn(other, remaining)                 # the unrelated stale entry was pruned
+        self.assertEqual(remaining[f"{digest}:rich_layout_recognition"]["id"], "file-api-test-1")
+
+    def test_a_bogus_cached_id_is_not_used(self):
+        import hashlib
+        import time as _time
+        path = self._write("x.pdf", contents=b"%PDF-x1")
+        digest = hashlib.sha256(b"%PDF-x1").hexdigest()
+        self.cache.write_text(json.dumps({f"{digest}:rich_layout_recognition":
+                                          {"id": "not-a-file-id", "at": int(_time.time())}}),
+                              encoding="utf-8")
+        parts, _, sent = self._parts([path])
+        self.assertEqual(len(sent), 1)                     # re-uploaded instead of forwarding it
+        self.assertTrue(parts[0]["file_id"].startswith("file-"))
 
     def test_the_cache_stores_no_name_and_no_path(self):
         path = self._write("secretly-named-report.pdf")
@@ -553,7 +617,7 @@ class RunTests(unittest.TestCase):
             # no key here: the point is the string is accepted as a path, not that it uploads
             captured, out = self._capture({"query": "q", "files": path})
         self.assertIsNone(captured.get("files"))
-        self.assertIn("one.txt", out)
+        self.assertIn("no API key available to upload it", out)   # accepted as a path, then stopped
         self.assertNotIn("absolute path is required", out)
 
 

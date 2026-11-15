@@ -45,14 +45,18 @@ starts, so a session that was already running keeps the tool set it loaded at st
 Requires `DEEPSEEK_API_KEY` in the Hermes environment (the same key the model uses). Without it
 the tool hides itself (`check_fn`) instead of failing at call time.
 
+Requires Hermes **≥ 0.23.0** (`requires_hermes` in the manifest): the plugin is built against the
+`register_tool` and `get_config` signatures verified on 0.23.1, and an older host would fail at
+load rather than at call time.
+
 ## Tool
 
 | Param | Type | Notes |
 |---|---|---|
 | `query` | string, required | The question. Say how it should be sourced when it matters. |
 | `urls` | string[] | Up to 10 http(s) pages to read as the basis of the answer. The vendor considers only the first 10 distinct URLs, and the model picks which to read. **Ignored with `thinking: true`**: the vendor then runs deep thinking search and does not read links separately. |
-| `image_url` | string | An https image to search/reason about (image search is part of `deepseek_web_search`). Publicly reachable, ≤8192 characters. |
-| `files` | string[] | Up to 3 **local** documents the question is about: absolute paths to PDF, DOCX/XLSX/PPTX, `.txt`/`.md`/`.csv` or an image (PNG/JPEG/WebP/GIF), ≤8 MB each and ≤12 MB total. Each file is **uploaded to the Files API first** (`rich_layout_recognition` for PDF/Word/PowerPoint so figures and tables reach the model, `user_data` for spreadsheets, plain text and images) and referenced by `file_id` — documents are refused inline by the vendor. Uploads are permanent, so the id is cached by content hash: asking about the same PDF twice costs one upload. Bytes are sent to DeepSeek, so credential paths (`.env*`, `~/.ssh`, `~/.local/secrets`, `~/.gnupg`) are refused outright, and every refusal is reported in the answer instead of being dropped silently. |
+| `image_url` | string | An https image to search/reason about (image search is part of `deepseek_web_search`). Publicly reachable, ≤8192 characters. Anything else — a `file:` URL, a 9000-character value — is **ignored** rather than sent: the vendor fetches the URL itself, so a typo there is a billed 400. |
+| `files` | string[] | Up to 3 **local** documents the question is about: absolute paths to PDF, DOCX/XLSX/PPTX, `.txt`/`.md`/`.csv` or an image (PNG/JPEG/WebP/GIF), ≤8 MB each and ≤12 MB total. Each file is **uploaded to the Files API first** (`rich_layout_recognition` for PDF/Word/PowerPoint so figures and tables reach the model, `user_data` for spreadsheets, plain text and images) and referenced by `file_id` — documents are refused inline by the vendor. Uploads are permanent, so the id is cached by content hash: asking about the same PDF twice costs one upload. Bytes are sent to DeepSeek, so credential paths (`.env*`, `~/.ssh`, `~/.local/secrets`, `~/.gnupg`) are refused outright, and every refusal is reported in the answer instead of being dropped silently. The document's text lands in the model's context, so a document you did not choose yourself is untrusted content — same rule as a web page. |
 | `thinking` | boolean | Per-call override. `true` = deep thinking search (multi-step, more expensive), `false` = a single search step. |
 
 Result: the answer, the citation list, the server steps actually used, and the billed request
