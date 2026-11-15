@@ -52,6 +52,7 @@ the tool hides itself (`check_fn`) instead of failing at call time.
 | `query` | string, required | The question. Say how it should be sourced when it matters. |
 | `urls` | string[] | Up to 10 http(s) pages to read as the basis of the answer. The vendor considers only the first 10 distinct URLs, and the model picks which to read. **Ignored with `thinking: true`**: the vendor then runs deep thinking search and does not read links separately. |
 | `image_url` | string | An https image to search/reason about (image search is part of `deepseek_web_search`). Publicly reachable, ≤8192 characters. |
+| `files` | string[] | Up to 3 **local** documents the question is about: absolute paths to PDF, DOCX/XLSX/PPTX, `.txt`/`.md`/`.csv` or an image (PNG/JPEG/WebP/GIF), ≤8 MB each and ≤12 MB total. The vendor parses layouts and tables into the context, so this replaces extracting the text yourself. Bytes are sent to DeepSeek, so credential paths (`.env*`, `~/.ssh`, `~/.local/secrets`, `~/.gnupg`) are refused outright, and every refusal is reported in the answer instead of being dropped silently. |
 | `thinking` | boolean | Per-call override. `true` = deep thinking search (multi-step, more expensive), `false` = a single search step. |
 
 Result: the answer, the citation list, the server steps actually used, and the billed request
@@ -112,7 +113,7 @@ uv run scripts/live_accept.py
 
 See [SECURITY.md](SECURITY.md). Short version: one outbound host (`api.deepseek.com`), the key is
 resolved through `agent.secret_scope.get_secret` (the profile-scoped accessor) and never
-logged, no file I/O, no subprocesses, no telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
+logged, no file I/O beyond the local documents you name in `files`, no subprocesses, no telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
 point the bearer key at another host is refused.
 
 ## Uninstall

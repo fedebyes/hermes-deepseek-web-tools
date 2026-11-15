@@ -12,6 +12,7 @@ script can import it from its own path without a plugin host.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -33,6 +34,28 @@ MAX_ATTEMPTS = 3
 MIN_TIMEOUT_S = 5
 MAX_TIMEOUT_S = 120   # above this a single call can outlive the 420 s tool deadline, and the
                       # await aborts while the worker thread keeps billing the vendor round
+MAX_FILES = 3         # a second, bigger document is a second call, not a bigger payload
+MAX_FILE_BYTES = 8 * 1024 * 1024      # per file; the vendor answers 413 above its body limit
+MAX_FILES_TOTAL_BYTES = 12 * 1024 * 1024
+# What the vendor parses into context: PDFs and Office documents, plus images and plain text.
+_FILE_MIME: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+# Attaching a file means its bytes leave this machine for the vendor, so the paths that hold
+# credentials are refused outright - a cheap guard that does not depend on remembering.
+_REFUSED_PATH_PARTS = ("/.env", "/.ssh/", "/.gnupg/", "/.local/secrets/", "/.password-store/",
+                       "/secrets/")
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DETAIL_LIMIT = 300    # never let a vendor error body flood the context
@@ -189,11 +212,99 @@ def as_bool(value: Any, *, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _looks_like_credentials(candidate: str) -> bool:
+    """True for the paths nobody should ever hand to a third party, by name or by location."""
+    lowered = candidate.lower()
+    if os.path.basename(lowered).startswith(".env"):
+        return True
+    return any(part in lowered for part in _REFUSED_PATH_PARTS)
+
+
+def file_parts(
+    paths: list[str] | None,
+    *,
+    max_files: int = MAX_FILES,
+    max_bytes: int = MAX_FILE_BYTES,
+    max_total: int = MAX_FILES_TOTAL_BYTES,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Turn local file paths into ``file`` content parts — the vendor's file input.
+
+    The vendor takes a base64 data URL (``file_data``) plus a ``filename``; there is no upload
+    step, so the bytes ride in the request body and the size caps are what stands between a
+    working call and a 413. Refusals are *reported*, never silent: a skipped file the model
+    cannot see is the difference between an answer about the document and a confident answer
+    about nothing. Credential paths are refused because attaching a file ships it to a third
+    party, and that decision should never be one forgotten path away.
+    """
+    parts: list[dict[str, str]] = []
+    notes: list[str] = []
+    total = 0
+
+    for raw in paths or []:
+        path = str(raw).strip()
+        if not path:
+            continue
+        if len(parts) >= max_files:
+            notes.append(f"{path} skipped - at most {max_files} files per call")
+            continue
+        if not os.path.isabs(path):
+            notes.append(f"{path} skipped - an absolute path is required")
+            continue
+        # What actually gets read is the link's *target*: a symlink named innocent.pdf pointing at
+        # ~/.local/secrets/key.txt would sail past a check on the string the caller passed, so every
+        # policy and filesystem decision below is made on the resolved path.
+        target = os.path.realpath(path)
+        if _looks_like_credentials(path) or _looks_like_credentials(target):
+            notes.append(f"{os.path.basename(path)} skipped - credentials are never attached")
+            continue
+        lowered = target.lower()
+        suffix = os.path.splitext(lowered)[1]
+        mime = _FILE_MIME.get(suffix)
+        if not mime:
+            allowed = ", ".join(sorted(_FILE_MIME))
+            notes.append(f"{path} skipped - unsupported type (allowed: {allowed})")
+            continue
+        try:
+            size = os.path.getsize(target)
+        except OSError:
+            notes.append(f"{path} skipped - not readable")
+            continue
+        if not os.path.isfile(target):
+            notes.append(f"{path} skipped - not a regular file")
+            continue
+        if size == 0:
+            notes.append(f"{path} skipped - empty file")
+            continue
+        if size > max_bytes:
+            notes.append(f"{os.path.basename(path)} skipped - {size} bytes, over the "
+                         f"{max_bytes} byte limit for one file")
+            continue
+        if total + size > max_total:
+            notes.append(f"{os.path.basename(path)} skipped - would put the payload over "
+                         f"{max_total} bytes")
+            continue
+        try:
+            with open(path, "rb") as handle:
+                encoded = base64.b64encode(handle.read()).decode("ascii")
+        except OSError:
+            notes.append(f"{path} skipped - not readable")
+            continue
+        total += size
+        parts.append({
+            "type": "file",
+            "file_data": f"data:{mime};base64,{encoded}",
+            "filename": os.path.basename(target),
+        })
+
+    return parts, notes
+
+
 def build_payload(
     *,
     query: str,
     urls: list[str] | None = None,
     image_url: str | None = None,
+    files: list[dict[str, str]] | None = None,
     thinking: bool = False,
     model: str = DEFAULT_MODEL,
     with_read_url: bool = True,
@@ -201,20 +312,20 @@ def build_payload(
     """The wire body for one ``web_research`` call.
 
     URLs are appended to the prompt: ``deepseek_read_url`` only looks at URLs *in* the last
-    user message, so a URL that is not in the text is a URL the model never sees.
+    user message, so a URL that is not in the text is a URL the model never sees. Attached
+    files are content parts, not prompt text - the vendor parses them into the context.
     """
     text = query.strip()
     picked = dedupe_urls(urls)
     if picked:
         text = f"{text}\n\nPages to read:\n" + "\n".join(picked)
 
-    if image_url:
-        content: Any = [
-            {"type": "text", "text": text},
-            {"type": "image_url", "image_url": {"url": image_url.strip()}},
-        ]
-    else:
-        content = text
+    content: Any = text
+    if image_url or files:
+        content = [{"type": "text", "text": text}]
+        if image_url:
+            content.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+        content.extend(files or [])
 
     tools: list[dict[str, str]] = [{"type": "deepseek_web_search"}]
     if with_read_url:
@@ -393,6 +504,7 @@ def research(
     *,
     urls: list[str] | None = None,
     image_url: str | None = None,
+    files: list[dict[str, str]] | None = None,
     thinking: bool = False,
     model: str = DEFAULT_MODEL,
     with_read_url: bool = True,
@@ -406,7 +518,7 @@ def research(
         raise WebToolsError(
             "DEEPSEEK_API_KEY is not available - set it in the Hermes environment ("
             "`hermes config set` or .env) to use web_research")
-    payload = build_payload(query=query, urls=urls, image_url=image_url,
+    payload = build_payload(query=query, urls=urls, image_url=image_url, files=files,
                             thinking=thinking, model=model, with_read_url=with_read_url)
     body = post(payload, key=resolved, base=base, timeout=timeout)
     return parse_response(body)
@@ -438,8 +550,15 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
 
     image_url = (args.get("image_url") or "").strip() or None
 
+    raw_files = args.get("files") or []
+    if isinstance(raw_files, str):                  # tolerate a bare path
+        raw_files = [raw_files]
+    elif isinstance(raw_files, dict):               # a mapping would otherwise iterate its keys
+        raw_files = list(raw_files.values())
+    parts, file_notes = file_parts([str(p) for p in raw_files])
+
     try:
-        result = research(query, urls=urls or None, image_url=image_url,
+        result = research(query, urls=urls or None, image_url=image_url, files=parts or None,
                           thinking=thinking, model=model, with_read_url=with_read_url,
                           timeout=clamp_timeout(timeout))
     except WebToolsError as exc:
@@ -456,4 +575,6 @@ def run(args: dict[str, Any], *, thinking_default: bool = False,
         notes.append(f"{over_cap} URL(s) over the vendor's 10-page cap not sent")
     if notes:
         text += f"\n\n({'; '.join(notes)}.)"
+    if file_notes:
+        text += f"\n\n({'; '.join(file_notes)}.)"
     return text

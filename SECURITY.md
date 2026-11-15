@@ -5,9 +5,9 @@ permissions. This file states exactly what it can reach, so you can decide befor
 
 ## Blast radius, in one sentence
 
-It registers one tool that makes one HTTPS request to `api.deepseek.com` and returns text; it
-touches no file, starts no process, imports nothing dynamic, and cannot act without a tool call
-from the model.
+It registers one tool that makes one HTTPS request to `api.deepseek.com` and returns text; the
+only files it ever opens are the ones you pass in `files`, it starts no process, imports nothing
+dynamic, and cannot act without a tool call from the model.
 
 ## Outbound traffic
 
@@ -15,9 +15,25 @@ from the model.
 |---|---|---|
 | `POST https://api.deepseek.com/chat/completions` | one per `web_research` call | `Authorization: Bearer $DEEPSEEK_API_KEY` |
 
-Nothing else is contacted — no telemetry, no update check, no vendor SDK. The prompt text and any
-URLs/images you pass are sent to DeepSeek, which is the point of the tool: treat a query as
-public content and do not put secrets in it.
+Nothing else is contacted — no telemetry, no update check, no vendor SDK. The prompt text, any
+URLs/images you pass and **the bytes of any file named in `files`** are sent to DeepSeek, which is
+the point of the tool: treat a query as public content and do not put secrets in it.
+
+## Local files (`files`)
+
+- Read **only** when a tool call names them: no directory walking, no globbing, no default path.
+- Refused before being opened: relative paths, non-regular files, empty files, anything over the
+  size caps, unsupported extensions, and every path that looks like a credential store
+  (`.env*`, `~/.ssh`, `~/.gnupg`, `~/.local/secrets`, `~/.password-store`, `*/secrets/`). The
+  refusal is reported in the answer; nothing is dropped silently.
+- Judged by **what will actually be read**: a symlink is resolved first, so a link named
+  `innocent.pdf` pointing into `~/.local/secrets` is refused like the file it names. This is a
+  policy on *paths*, not a sandbox: a hardlink to a credential file has no path to inspect and
+  cannot be told apart from the original, and a caller who deliberately points the tool at a
+  secret is doing exactly what the argument says. The guard exists so that an accident — or an
+  injected instruction — cannot quietly ship a keyring.
+- Encoded as a base64 `data:` URL in the request body, held in memory only — the plugin writes no
+  temporary file and logs neither the path nor the contents.
 
 ## The API key
 
