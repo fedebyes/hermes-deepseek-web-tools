@@ -212,6 +212,14 @@ def as_bool(value: Any, *, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _looks_like_credentials(candidate: str) -> bool:
+    """True for the paths nobody should ever hand to a third party, by name or by location."""
+    lowered = candidate.lower()
+    if os.path.basename(lowered).startswith(".env"):
+        return True
+    return any(part in lowered for part in _REFUSED_PATH_PARTS)
+
+
 def file_parts(
     paths: list[str] | None,
     *,
@@ -242,11 +250,14 @@ def file_parts(
         if not os.path.isabs(path):
             notes.append(f"{path} skipped - an absolute path is required")
             continue
-        lowered = path.lower()
-        if any(part in lowered for part in _REFUSED_PATH_PARTS) or \
-                os.path.basename(lowered).startswith(".env"):
+        # What actually gets read is the link's *target*: a symlink named innocent.pdf pointing at
+        # ~/.local/secrets/key.txt would sail past a check on the string the caller passed, so every
+        # policy and filesystem decision below is made on the resolved path.
+        target = os.path.realpath(path)
+        if _looks_like_credentials(path) or _looks_like_credentials(target):
             notes.append(f"{os.path.basename(path)} skipped - credentials are never attached")
             continue
+        lowered = target.lower()
         suffix = os.path.splitext(lowered)[1]
         mime = _FILE_MIME.get(suffix)
         if not mime:
@@ -254,11 +265,11 @@ def file_parts(
             notes.append(f"{path} skipped - unsupported type (allowed: {allowed})")
             continue
         try:
-            size = os.path.getsize(path)
+            size = os.path.getsize(target)
         except OSError:
             notes.append(f"{path} skipped - not readable")
             continue
-        if not os.path.isfile(path):
+        if not os.path.isfile(target):
             notes.append(f"{path} skipped - not a regular file")
             continue
         if size == 0:
@@ -282,7 +293,7 @@ def file_parts(
         parts.append({
             "type": "file",
             "file_data": f"data:{mime};base64,{encoded}",
-            "filename": os.path.basename(path),
+            "filename": os.path.basename(target),
         })
 
     return parts, notes

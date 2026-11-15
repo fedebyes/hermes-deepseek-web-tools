@@ -223,6 +223,35 @@ class FileInputTests(unittest.TestCase):
         # nothing was read: an empty part list is the assertion that the bytes never left
         self.assertEqual(parts, [])
 
+    def test_a_symlink_into_a_credential_store_is_refused_by_its_target(self):
+        """A link named innocent.pdf must be judged by where it points, not by its own name."""
+        secret_dir = os.path.join(self.tmp.name, ".local", "secrets")
+        os.makedirs(secret_dir, exist_ok=True)
+        secret = os.path.join(secret_dir, "key.txt")
+        with open(secret, "w", encoding="utf-8") as handle:
+            handle.write("s\n")
+        link = os.path.join(self.tmp.name, "innocent.pdf")
+        os.symlink(secret, link)
+        parts, notes = client.file_parts([link])
+        self.assertEqual(parts, [])
+        self.assertIn("credentials are never attached", notes[0])
+
+    def test_a_legit_symlink_resolves_and_reports_the_target_name(self):
+        real = self._write("real.pdf")
+        link = os.path.join(self.tmp.name, "alias.pdf")
+        os.symlink(real, link)
+        parts, notes = client.file_parts([link])
+        self.assertEqual(notes, [])
+        self.assertEqual(parts[0]["filename"], "real.pdf")
+
+    def test_a_dot_env_symlink_is_refused(self):
+        env_file = self._write("dotenv-source", contents=b"SECRET=1\n")
+        link = os.path.join(self.tmp.name, ".env")
+        os.symlink(env_file, link)
+        parts, notes = client.file_parts([link])
+        self.assertEqual(parts, [])
+        self.assertIn("credentials are never attached", notes[0])
+
     def test_at_most_three_files_and_the_extras_are_reported(self):
         paths = [self._write(f"f{i}.txt") for i in range(5)]
         parts, notes = client.file_parts(paths)

@@ -26,6 +26,12 @@ the point of the tool: treat a query as public content and do not put secrets in
   size caps, unsupported extensions, and every path that looks like a credential store
   (`.env*`, `~/.ssh`, `~/.gnupg`, `~/.local/secrets`, `~/.password-store`, `*/secrets/`). The
   refusal is reported in the answer; nothing is dropped silently.
+- Judged by **what will actually be read**: a symlink is resolved first, so a link named
+  `innocent.pdf` pointing into `~/.local/secrets` is refused like the file it names. This is a
+  policy on *paths*, not a sandbox: a hardlink to a credential file has no path to inspect and
+  cannot be told apart from the original, and a caller who deliberately points the tool at a
+  secret is doing exactly what the argument says. The guard exists so that an accident — or an
+  injected instruction — cannot quietly ship a keyring.
 - Encoded as a base64 `data:` URL in the request body, held in memory only — the plugin writes no
   temporary file and logs neither the path nor the contents.
 
