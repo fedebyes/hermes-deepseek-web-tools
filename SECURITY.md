@@ -33,11 +33,15 @@ the point of the tool: treat a query as public content and do not put secrets in
   cannot be told apart from the original, and a caller who deliberately points the tool at a
   secret is doing exactly what the argument says. The guard exists so that an accident — or an
   injected instruction — cannot quietly ship a keyring.
-- Uploaded to the Files API, not inlined: the vendor refuses documents in a chat request.
-  The returned `file-id` is cached in `~/.local/state/hermes/deepseek-web-tools-files.json`
-  keyed by content hash and purpose — the file name and the path are stored nowhere, and an
-  entry older than 30 days is dropped. The plugin writes no temporary copy of the file and
-  logs neither its path nor its contents.
+- Uploaded to the Files API, not inlined: the vendor refuses documents in a chat request. The
+  name goes over the wire **sanitised** (`[^A-Za-z0-9._-]` folded to `_`) — it is a label for
+  the vendor, never a header that can be split on a quote or a newline.
+- The returned `file-id` is cached in `~/.local/state/hermes/deepseek-web-tools-files.json`
+  (mode `0600`) keyed by `sha256(content):purpose`. The file stores the id and a timestamp —
+  **no path, no file name, no content** — and an entry older than 30 days is dropped. The plugin
+  writes no temporary copy of the file and logs neither its path nor its contents.
+- Uploads are permanent on the vendor's side: there is no delete call, so a document sent once
+  stays there. Do not pass a file you would not be willing to publish.
 
 ## The API key
 

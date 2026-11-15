@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -254,8 +255,27 @@ def _cache_write(cache_path: Path, entries: dict[str, Any]) -> None:
         path = Path(cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(entries, indent=1, sort_keys=True), encoding="utf-8")
+        os.chmod(path, 0o600)
     except OSError as exc:
         logger.debug("file cache write failed: %s", exc)
+
+
+def _safe_filename(filename: str, suffix: str = "") -> str:
+    """A name that cannot break the multipart header.
+
+    The vendor only needs something readable: the real name can carry quotes, CR/LF and
+    non-ASCII, and interpolated raw it either truncates the header or injects a new one.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._-")
+    return cleaned or f"file{suffix}"
+
+
+def _entry_time(entry: Any) -> int:
+    """A cache entry's timestamp, 0 when it is corrupt — a bad entry costs an upload, not a call."""
+    try:
+        return int((entry or {}).get("at") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
 
 def _multipart(purpose: str, filename: str, mime: str, data: bytes) -> tuple[bytes, str]:
@@ -292,7 +312,9 @@ def upload_file(
     only, and a PDF sent that way comes back 400. Upload, then reference the id.
     """
     url = f"{(base or base_url()).rstrip('/')}/files"
-    body, content_type = _multipart(purpose, filename, mime, data)
+    body, content_type = _multipart(purpose, _safe_filename(filename,
+                                                           os.path.splitext(filename)[1]),
+                                    mime, data)
     request = urllib.request.Request(
         url,
         data=body,
@@ -400,9 +422,10 @@ def file_parts(
         digest = hashlib.sha256(data).hexdigest()
         cache_key = f"{digest}:{purpose}"
         cached = cache.get(cache_key)
+        cached_id = str((cached or {}).get("id") or "") if isinstance(cached, dict) else ""
         file_id = ""
-        if isinstance(cached, dict) and now - int(cached.get("at") or 0) < FILES_CACHE_MAX_AGE_S:
-            file_id = str(cached.get("id") or "")
+        if cached_id.startswith("file-") and now - _entry_time(cached) < FILES_CACHE_MAX_AGE_S:
+            file_id = cached_id
         if not file_id:
             if not key:
                 notes.append(f"{os.path.basename(path)} skipped - no API key available to upload it")
@@ -413,13 +436,12 @@ def file_parts(
             except WebToolsError as exc:
                 notes.append(f"{os.path.basename(path)} skipped - {exc}")
                 continue
-            cache[cache_key] = {"id": file_id, "at": now, "name": os.path.basename(target),
-                                "purpose": purpose}
+            cache[cache_key] = {"id": file_id, "at": now}
         total += size
         parts.append({"type": "file", "file_id": file_id})
 
     stale = [k for k, v in cache.items()
-             if not isinstance(v, dict) or now - int(v.get("at") or 0) >= FILES_CACHE_MAX_AGE_S]
+             if not isinstance(v, dict) or now - _entry_time(v) >= FILES_CACHE_MAX_AGE_S]
     if stale:
         for key_ in stale:
             cache.pop(key_, None)

@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -312,6 +313,47 @@ class FileInputTests(unittest.TestCase):
         parts, notes, _ = self._parts([big, second])
         self.assertEqual(len(parts), 1)
         self.assertIn("would put the payload over", notes[0])
+
+    def test_a_hostile_filename_cannot_break_the_part_header(self):
+        """Quotes, CRLF and non-ASCII in a local name must not split or inject a header."""
+        path = self._write('a"\r\nX-Injected: 1.pdf', contents=b"%PDF-x")
+        parts, notes, sent = self._parts([path])
+        self.assertEqual(notes, [])
+        body = self._form(sent[0])
+        self.assertNotIn(b'a"\r\n', body)                   # the raw name never reaches the wire
+        self.assertEqual(body.count(b'name="file"'), 1)     # one file part, not two
+        match = re.search(rb'filename="([^"]*)"', body)
+        self.assertIsNotNone(match)
+        name = match.group(1).decode()
+        self.assertRegex(name, r"^[A-Za-z0-9._-]+$")        # no quotes, no CRLF, no colon
+        self.assertTrue(name.endswith(".pdf"))
+        # the header line ends where it should: the injected text lives inside the name, not as a header
+        header_line = [line for line in body.split(b"\r\n") if b"filename=" in line][0]
+        self.assertNotIn(b":", header_line.split(b"filename=")[1])
+
+    def test_the_cache_stores_no_name_and_no_path(self):
+        path = self._write("secretly-named-report.pdf")
+        self._parts([path])
+        raw = self.cache.read_text(encoding="utf-8")
+        self.assertIn("file-api-test-1", raw)              # the id is the point
+        self.assertNotIn("secretly-named-report", raw)     # ... and nothing about the file
+        self.assertNotIn(self.tmp.name, raw)
+
+    def test_a_corrupt_cache_entry_costs_an_upload_not_a_crash(self):
+        path = self._write("report.pdf")
+        self.cache.write_text(json.dumps({}), encoding="utf-8")
+        parts, notes, first = self._parts([path])
+        self.assertEqual(len(parts), 1)
+        # hand-mangle the entry: a non-numeric timestamp and a bogus id
+        entry = json.loads(self.cache.read_text(encoding="utf-8"))
+        for value in entry.values():
+            value["at"] = "not-a-number"
+            value["id"] = "not-a-file-id"
+        self.cache.write_text(json.dumps(entry), encoding="utf-8")
+        parts, notes, sent = self._parts([path])
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(len(sent), 1)                     # it re-uploaded instead of trusting it
+        self.assertTrue(parts[0]["file_id"].startswith("file-"))
 
     def test_file_parts_follow_the_text_in_the_payload(self):
         path = self._write("report.pdf")
