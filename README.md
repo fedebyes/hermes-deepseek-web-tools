@@ -113,7 +113,8 @@ uv run scripts/live_accept.py
 
 See [SECURITY.md](SECURITY.md). Short version: one outbound host (`api.deepseek.com`), the key is
 resolved through `agent.secret_scope.get_secret` (the profile-scoped accessor) and never
-logged, no file I/O beyond the local documents you name in `files`, no subprocesses, no telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
+logged, no file I/O beyond the local documents you name in `files` and the upload-id cache that
+keeps them from being sent twice, no subprocesses, no telemetry. `DEEPSEEK_BASE_URL` exists for tests only and is validated — an override that would
 point the bearer key at another host is refused.
 
 ## Uninstall
@@ -121,7 +122,10 @@ point the bearer key at another host is refused.
 ```bash
 hermes plugins disable deepseek-web-tools
 hermes plugins remove deepseek-web-tools
+rm -f ~/.local/state/hermes/deepseek-web-tools-files.json   # the upload-id cache
 ```
+
+Uploads already sent to the vendor stay there: there is no delete call.
 
 ## License
 

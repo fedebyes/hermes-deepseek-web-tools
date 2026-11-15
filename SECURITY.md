@@ -68,7 +68,9 @@ so there is deliberately no escape hatch: anyone who can set one variable can se
 - **No hooks.** No `pre_tool_call`, no `pre_llm_call`, no `on_session_*` — this plugin cannot see,
   rewrite or veto anything else the agent does.
 - **No overrides.** `web_research` is a new name; it replaces no built-in tool.
-- **No side effects outside the response.** No writes, no `subprocess`, no `eval`, no dynamic
+- **No side effects outside the response**, with exactly one exception: the upload-id cache under
+  `~/.local/state/hermes/` — id and timestamp only, mode `0600` — which is what keeps a second
+  question about the same document from uploading it again. No `subprocess`, no `eval`, no dynamic
   imports.
 - Failures are returned as a short string (`web_research failed: …`) and never raised: a plugin that
   throws inside a tool handler breaks the agent loop.
